@@ -1,6 +1,25 @@
 # ThreatLens — Architecture
 
-Living document. Updated at the end of each build day. Last updated: **Day 2**.
+Living document. Updated at the end of each build day. Last updated: **Day 2 (post-redesign, P0 roadmap Phase 1)**.
+
+## Submission roadmap (tracked — updated after every phase)
+
+Target: stable, fully tested submission by Nov 24-25, 2026 (deadline Nov 26,
+11:59 PM ET). Order is dependency-driven: #1 is small and unblocks nothing
+else; #3 is the biggest lift and #5 can't fully finish without it; #2 is
+independent and substantial; #4 needs final screenshots, so it's last.
+
+| # | Item | Status |
+|---|---|---|
+| 1 | Better statistical explanations | **Done.** Thresholds now embedded in every reason string (generated from the real constants, not retyped) plus a durable "Detection rule reference" panel on the dashboard; explanation-correctness tests added. |
+| 3 | Case investigation workflow | **Not started** (schema only, from Day 1). Next up. |
+| 5 | Royal-blue UI | **Mostly done** (dashboard + admin). Blocked from "complete" only by #3 — no case screens exist yet to style. |
+| 2 | ML evaluation (precision/recall) | **Not started.** |
+| 4 | README + architecture diagram | **Not started.** Deliberately last — needs the finished UI for screenshots. |
+
+See `docs/DEBUGGING_LOG.md` for what was actually verified at each step —
+this table tracks scope, not proof; don't treat "Done" here as a
+substitute for that log's verification trail.
 
 ## What this app is
 

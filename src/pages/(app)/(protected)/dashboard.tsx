@@ -25,6 +25,7 @@ import {
   StatCard,
 } from '@/components/ui'
 import { ActivityChart, RuleDistributionChart, type DayBucket, type RuleCount } from '@/components/charts'
+import { RULE_WEIGHTS } from '@/lib/anomaly-detection'
 
 interface AuthEventRecord {
   timestamp: number
@@ -361,6 +362,20 @@ export default function DashboardPage() {
                   ))}
                 </ul>
               )}
+            </div>
+
+            <div className="mt-5 border-t border-border pt-4">
+              <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Detection rule reference
+              </h3>
+              <ul className="space-y-1 text-xs text-muted-foreground" data-testid="rule-reference">
+                {RULE_WEIGHTS.map((rule) => (
+                  <li key={rule.label}>
+                    <span className="font-medium text-foreground">{rule.label}</span> (+{rule.weight.toFixed(1)}):{' '}
+                    {rule.threshold}
+                  </li>
+                ))}
+              </ul>
             </div>
           </Modal.Body>
         </Modal>

@@ -54,12 +54,34 @@ export const IMPOSSIBLE_TRAVEL_MIN_DISTANCE_KM = 300
 /** Faster than a commercial flight — implausible for one person, two logins. */
 export const IMPOSSIBLE_TRAVEL_MIN_KMH = 800
 
-/** Each matched rule adds this many points to an event's score, summed and
- *  capped at 1. The order here is also the canonical display order. */
-export const RULE_WEIGHTS: ReadonlyArray<{ label: string; weight: number }> = [
-  { label: 'Failed-login burst', weight: 0.5 },
-  { label: 'Impossible travel', weight: 0.6 },
-  { label: 'New device', weight: 0.3 },
+/**
+ * One entry per rule: its scoring weight AND a durable, analyst-facing
+ * description of its threshold — "what does this rule actually check, and
+ * at what bar." `computeScore` reads `.weight`; the dashboard's rule
+ * reference reads `.threshold`. Kept as ONE array (not two) on purpose:
+ * two separate `{label, weight}` lists inviting someone to edit one and
+ * forget the other is exactly the kind of drift that would make a
+ * displayed explanation stop matching the actual logic. Every threshold
+ * string below is interpolated from the real exported constants above, not
+ * retyped — a test (anomaly-detection.test.ts, "rule reference thresholds
+ * match the actual constants") fails if that ever stops being true.
+ */
+export const RULE_WEIGHTS: ReadonlyArray<{ label: string; weight: number; threshold: string }> = [
+  {
+    label: 'Failed-login burst',
+    weight: 0.5,
+    threshold: `${FAILED_LOGIN_BURST_THRESHOLD}+ failed logins for one account within ${FAILED_LOGIN_BURST_WINDOW_SECONDS / 60} minutes`,
+  },
+  {
+    label: 'Impossible travel',
+    weight: 0.6,
+    threshold: `implied speed of ${IMPOSSIBLE_TRAVEL_MIN_KMH}+ km/h between two logins at least ${IMPOSSIBLE_TRAVEL_MIN_DISTANCE_KM}+ km apart`,
+  },
+  {
+    label: 'New device',
+    weight: 0.3,
+    threshold: "any device not previously seen for this account (its very first event is exempt)",
+  },
 ]
 
 function addReason(target: Map<string, string[]>, recordId: string, reason: string): void {
@@ -97,7 +119,8 @@ function detectFailedLoginBursts(sortedEvents: AuthEventInput[]): Map<string, st
   for (const [recordId, { count, spanMinutes }] of best) {
     reasons.set(
       recordId,
-      `Failed-login burst: ${count} failed attempts within ${spanMinutes} minute${spanMinutes === 1 ? '' : 's'}`,
+      `Failed-login burst: ${count} failed attempts within ${spanMinutes} minute${spanMinutes === 1 ? '' : 's'}` +
+        ` (flagged at ${FAILED_LOGIN_BURST_THRESHOLD}+ within ${FAILED_LOGIN_BURST_WINDOW_SECONDS / 60} min)`,
     )
   }
   return reasons
@@ -128,7 +151,8 @@ function detectImpossibleTravel(sortedEvents: AuthEventInput[]): Map<string, str
     const elapsedMinutes = Math.max(1, Math.round(elapsedSeconds / 60))
     reasons.set(
       curr.recordId,
-      `Impossible travel: ${prev.city} -> ${curr.city} in ${elapsedMinutes} minute${elapsedMinutes === 1 ? '' : 's'} (~${Math.round(impliedKmh)} km/h implied)`,
+      `Impossible travel: ${prev.city} -> ${curr.city} in ${elapsedMinutes} minute${elapsedMinutes === 1 ? '' : 's'}` +
+        ` (~${Math.round(impliedKmh)} km/h implied, flagged at ${IMPOSSIBLE_TRAVEL_MIN_KMH}+ km/h over ${IMPOSSIBLE_TRAVEL_MIN_DISTANCE_KM}+ km)`,
     )
   }
   return reasons
@@ -147,7 +171,11 @@ function detectNewDevice(sortedEvents: AuthEventInput[]): Map<string, string> {
     const e = sortedEvents[i]
     if (i > 0 && !seen.has(e.device)) {
       const priorDevices = [...seen].join(', ') || 'none'
-      reasons.set(e.recordId, `New device: first use of '${e.device}' for this account (previously ${priorDevices})`)
+      reasons.set(
+        e.recordId,
+        `New device: first use of '${e.device}' for this account (previously ${priorDevices})` +
+          ' (flagged: any device not seen before in this account\'s history, except its very first event)',
+      )
     }
     seen.add(e.device)
   }

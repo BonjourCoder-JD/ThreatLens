@@ -4,6 +4,8 @@ import {
   FAILED_LOGIN_BURST_THRESHOLD,
   FAILED_LOGIN_BURST_WINDOW_SECONDS,
   IMPOSSIBLE_TRAVEL_MIN_KMH,
+  IMPOSSIBLE_TRAVEL_MIN_DISTANCE_KM,
+  RULE_WEIGHTS,
   type AuthEventInput,
 } from './anomaly-detection'
 import dataset from '../data/synthetic-auth-events.json'
@@ -177,6 +179,52 @@ describe('computeStatScores — scoring is explainable and deterministic', () =>
     const r = scoreOf(computeStatScores(events), 'a')
     expect(r.statReasons).toEqual([])
     expect(r.statAnomalyScore).toBe(0)
+  })
+})
+
+describe('explanations: threshold text matches the actual scoring logic', () => {
+  it('rule reference thresholds are generated from the real exported constants, not retyped', () => {
+    // These assertions would fail if someone changed a threshold constant
+    // and forgot to update RULE_WEIGHTS' description — which is the whole
+    // point: the displayed explanation can't silently drift from the logic.
+    const burst = RULE_WEIGHTS.find((r) => r.label === 'Failed-login burst')!
+    expect(burst.threshold).toContain(String(FAILED_LOGIN_BURST_THRESHOLD))
+    expect(burst.threshold).toContain(String(FAILED_LOGIN_BURST_WINDOW_SECONDS / 60))
+
+    const travel = RULE_WEIGHTS.find((r) => r.label === 'Impossible travel')!
+    expect(travel.threshold).toContain(String(IMPOSSIBLE_TRAVEL_MIN_KMH))
+    expect(travel.threshold).toContain(String(IMPOSSIBLE_TRAVEL_MIN_DISTANCE_KM))
+  })
+
+  it('a burst reason states both the observed count and the configured threshold', () => {
+    const events = [0, 1, 2, 3, 4].map((i) =>
+      event({ recordId: `f${i}`, eventType: 'failed_login', success: 0, timestamp: BASE_TS + i * 10 }),
+    )
+    const reason = scoreOf(computeStatScores(events), 'f0').statReasons[0]
+    expect(reason).toContain('5 failed attempts') // observed evidence
+    expect(reason).toContain(`${FAILED_LOGIN_BURST_THRESHOLD}+`) // the actual threshold
+    expect(reason).toContain(`${FAILED_LOGIN_BURST_WINDOW_SECONDS / 60} min`)
+  })
+
+  it('a travel reason states the observed speed and the configured threshold', () => {
+    const events = [
+      event({ recordId: 'a', city: 'New York', timestamp: BASE_TS }),
+      event({ recordId: 'b', city: 'Lagos', timestamp: BASE_TS + 600 }),
+    ]
+    const reason = scoreOf(computeStatScores(events), 'b').statReasons[0]
+    expect(reason).toMatch(/~\d+ km\/h implied/) // observed evidence
+    expect(reason).toContain(`${IMPOSSIBLE_TRAVEL_MIN_KMH}+ km/h`) // the actual threshold
+    expect(reason).toContain(`${IMPOSSIBLE_TRAVEL_MIN_DISTANCE_KM}+ km`)
+  })
+
+  it('a new-device reason names both the new and prior device(s)', () => {
+    const events = [
+      event({ recordId: 'a', device: 'Windows-Chrome', timestamp: BASE_TS }),
+      event({ recordId: 'b', device: 'Linux-Firefox', timestamp: BASE_TS + 100 }),
+    ]
+    const reason = scoreOf(computeStatScores(events), 'b').statReasons[0]
+    expect(reason).toContain("'Linux-Firefox'")
+    expect(reason).toContain('Windows-Chrome')
   })
 })
 
