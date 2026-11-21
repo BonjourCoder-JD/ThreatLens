@@ -945,6 +945,147 @@ failure, so a visual check is the only thing that catches it.
 
 ---
 
+## Feature: Case investigation workflow
+
+### What it does and why it exists
+
+Lets analysts turn one or more flagged events into a tracked investigation:
+status, priority, assignment, a chronological note thread, and the linked
+events with their detection explanations inline. This is the collaborative
+half of ThreatLens — everything before this phase was one analyst looking
+at data; this is multiple analysts working a shared queue together.
+
+### Files, functions, data structures
+
+- `src/actions/case-actions.ts` — `createCaseFromEvents`, the one server
+  action in the whole feature.
+- `src/lib/call-action.ts` — tiny shared `callAction(name, params)` client
+  helper (the documented fetch-with-bearer-token pattern, in one place).
+- `src/components/CreateCaseModal.tsx` — the creation form, used from two
+  entry points on the dashboard.
+- `src/components/EventReasons.tsx` — `EventReasons`/`RuleReference`,
+  extracted from the dashboard's detail modal so the case detail page's
+  linked-events list shows the identical explanation UI.
+- `src/pages/(app)/(protected)/cases/index.tsx` — case list.
+- `src/pages/(app)/(protected)/cases/[id].tsx` — case detail (status/
+  priority/assignment, linked events, notes).
+- `src/pages/(app)/(protected)/dashboard.tsx` — gained a checkbox column,
+  a selection-aware "Open case from N selected" bar, and an "Open case from
+  this event" button in the detail modal.
+
+### Data flow
+
+See `docs/ARCHITECTURE.md`'s "Phase 2" section for the full creation →
+sync → authorization trace. The short version: creation goes through a
+server action (justified below); every other write is a plain client
+mutation; every read is `useQuery`, which is also what makes sync free —
+nobody wrote any sync code, `useQuery`'s WebSocket subscription already
+does it.
+
+### Design decisions & tradeoffs
+
+- **One server action, not a blanket "wrap everything in actions"
+  policy.** Status/priority/assignment edits and note creation are plain
+  `useMutations` calls — the schema already permits them for `member`, and
+  wrapping a single-table write in a server action would add a network hop
+  and a second code path for zero benefit. The ONE place a server action
+  earns its keep is creation, because it genuinely orchestrates two
+  collections (case + its origin note) — see the action-routes.ts header
+  comment on when an action is actually warranted versus reflexive.
+- **`EventReasons`/`RuleReference` extracted mid-phase, not written twice.**
+  The case detail page needed the exact same "why was this flagged" UI the
+  dashboard already had. Copy-pasting it would have meant two places to
+  keep in sync forever; extracting it the moment a second caller appeared
+  is the normal "rule of three... actually rule of two here" judgment call.
+- **Delete is the one case operation gated to the creator (or admin).**
+  Every other mutation is open to any analyst (small shared-team model).
+  Narrowing specifically for delete — not status, not assignment — is a
+  deliberate asymmetry: destructive operations get a narrower boundary
+  than collaborative edits, which is the same instinct behind Day 1's
+  "authEvents denies writes to every role" decision, applied with a
+  lighter touch here because cases, unlike the log, are meant to be
+  collaboratively edited.
+
+### DeepSpace SDK capabilities used
+
+- Server action (`ActionHandler`, `ActionContext`, `tools.create`) for
+  `createCaseFromEvents`.
+- `useQuery`/`useMutations` (`put`, `createConfirmed`, `removeConfirmed`)
+  for everything else.
+- `useUsers()` for the assignee dropdown (the public-identity roster —
+  exactly what it's documented for: "fields collaborators need to name
+  each other").
+- `useUserLookup().getName(userId)` to resolve note authors and assignees
+  to display names.
+- `getAuthToken()` (via `callAction`) for the server-action POST.
+
+### Likely bugs & how to diagnose them
+
+- **A real one, already hit:** a test cleanup step using
+  `element.isVisible()` immediately after `page.goto(...)` almost always
+  returns `false`, because it doesn't wait for the page's data to load —
+  it's an instant check, not an assertion. See `docs/DEBUGGING_LOG.md`
+  ("test cleanup silently wasn't running"). The fix pattern —
+  `await locator.waitFor({ state: 'visible', timeout })` before checking —
+  applies anywhere a test needs to know "has this async-loaded thing
+  actually appeared," not just in cleanup code.
+- **Symptom: a case shows 0 linked events even though it was created with
+  some.** Check whether `authEvents` has finished loading before
+  `relatedEventIds` is matched against it — both queries resolve
+  independently, so there's a brief window where `cases` has loaded but
+  `authEvents` hasn't. Not currently guarded with a combined loading state;
+  a good thing to add if this becomes a visible flicker in practice.
+- **Symptom: the assignee dropdown is empty.** `useUsers()` only returns
+  users who have connected at least once (the roster is populated from the
+  `users` collection, written at sign-in) — a newly test-created account
+  won't appear until it has signed in once.
+
+### Interview questions you might get, and good answers
+
+- **"Walk me through exactly what happens, server-side, when I click
+  'Open case.'"** → The browser POSTs to `/api/actions/createCaseFromEvents`
+  with a bearer token; `action-routes.ts` verifies the JWT, looks up the
+  action by name, and calls it with `{ userId, params, tools, env,
+  callerJwt }`. The action validates the input, calls
+  `tools.create('cases', ...)` (which reaches the `AppRecordRoom` DO via an
+  internal fetch carrying `X-App-Action: true` — RBAC bypassed because this
+  is the app's own server code, not a user's direct write), then does the
+  same for `caseNotes`. Both writes are attributed to the real caller's
+  userId, not the app owner, because that's what `X-User-Id` was set to.
+- **"How do you know the real-time sync actually works, not just that the
+  code looks right?"** → `tests/collab.spec.ts` opens two separate,
+  independently-signed-in Playwright browser contexts, has one create a
+  case/change its status/add a note, and asserts the OTHER browser's
+  already-rendered page updates without a reload — a real WebSocket
+  round-trip between two real client connections, not a mock.
+- **"Why didn't you just let any analyst delete any case, like the other
+  fields?"** → Deletion is destructive and irreversible; the other edits
+  (status, priority, assignment, notes) are corrections a team can make to
+  each other's work without real loss, and deliberately stay open to
+  support that. I'd revisit this if cases needed an audit trail of status
+  changes too — right now, overwriting `status` is also technically
+  "destructive" to the previous value, and the only place that history
+  survives is the notes thread if someone wrote one.
+
+### Practice exercise
+
+Add a "reopen" action: when a `resolved` or `false_positive` case's status
+is changed back to `open` or `investigating`, automatically append a system
+note ("Reopened by `<name>`") the same way case creation appends its
+origin note. Decide: does this belong in the client (call
+`createConfirmed` right after `put` succeeds) or does it need a server
+action? (Hint: compare against why `createCaseFromEvents` needed one and
+status edits didn't — what's actually different here?)
+
+### Verifying the modification
+
+Add a case, change its status back and forth, and check `caseNotes` for
+the new row — `npx deepspace test run e2e --port=5273` is the fastest way
+to confirm nothing else in the case workflow broke, since `collab.spec.ts`
+exercises the full create → status → note lifecycle already.
+
+---
+
 ## AI-assisted code: how it was verified
 
 Every piece of SDK usage above was checked against the documented contract

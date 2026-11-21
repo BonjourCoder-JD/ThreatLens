@@ -49,6 +49,49 @@ being tested.
 
 ---
 
+## Phase 2 (cases) — Incident: test cleanup silently wasn't running
+
+**Error observed.** None — again the dangerous kind. After the full case
+workflow test suite passed (20/20), a manual check of `/cases` showed six
+leftover `__test-`-prefixed cases that should have been deleted by each
+test's own `finally` block.
+
+**Initial hypothesis.** The cleanup code was
+`if (await deleteButton.isVisible().catch(() => false)) { ...delete... }`
+run right after `page.goto('/cases/:id')`. My hypothesis: `isVisible()` is
+a single, immediate check — it doesn't wait for anything — so it almost
+always ran before the page's `useQuery('cases')` subscription had loaded
+the case data and rendered the delete button, found nothing, and silently
+skipped cleanup every time.
+
+**Investigation.** Wrote a throwaway script
+(`tests/_cleanup-check.spec.ts`, deleted after use) that listed every case
+title — confirmed six `__test-` cases present. Rewrote a cleanup pass to
+explicitly wait for `case-status-select` (a reliable "the page actually
+loaded" signal) before looking for the delete button, and it successfully
+deleted them.
+
+**Fix.** In both `tests/collab.spec.ts` and `tests/api.spec.ts`, every
+cleanup `finally` block now does `await page.getByTestId('case-status-
+select').waitFor({ state: 'visible', timeout: 10_000 })` before checking
+for the delete button with `.count()` (not `.isVisible()` — `count()` on a
+button that genuinely isn't there, e.g. a non-owner's page, correctly
+returns 0 without waiting the full timeout). The whole block is wrapped in
+try/catch so a cleanup failure never masks the actual test's pass/fail
+result.
+
+**Test result.** Re-ran the full suite: all cases created during the run
+were confirmed deleted afterward (`/cases` empty of `__test-` rows).
+
+**Why this matters.** The test *assertions* were correct the whole
+time — this bug only affected cleanup, not what was being verified. But a
+cleanup step that silently no-ops is exactly the kind of thing that looks
+fine right up until a shared dev database fills up with junk, so it was
+worth fixing immediately rather than shrugging it off as "the real test
+still passed."
+
+---
+
 ## Day 2 (UI redesign) — Incident: activity chart rendered as a blank area
 
 **Error observed.** After building the royal-blue redesign, I took a set of

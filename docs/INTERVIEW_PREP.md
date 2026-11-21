@@ -140,6 +140,60 @@ flagged rows is the next step once data exists" — not a flat "yes."
 loud why removing it would make the detector worse, with a concrete
 example event sequence.
 
+## Phase 2 (cases): the three things to be able to explain cold
+
+**1. The case-creation data flow, start to finish.** Practice saying this
+without notes: "Analyst selects events on the dashboard → clicks Open case
+→ a modal collects a title → that calls a server action, not a direct
+database write, because I want the case AND its origin note created
+together → the action verifies the caller's JWT, then uses the RBAC-bypass
+tools to write both `cases` and `caseNotes`, attributed to the real analyst
+→ the browser gets redirected to the new case's URL." If asked "why a
+server action and not just `useMutations`," the answer is specifically
+about the TWO writes needing to happen together, not a blanket policy —
+see `docs/CODE_WALKTHROUGH.md`'s "one server action, not a blanket policy."
+
+**2. How real-time sync works here, mechanically.** There is no sync code
+to point to — that's the point. `useQuery` opens a WebSocket per scope; a
+write from any client (fire-and-forget `put`, or the confirmed variants)
+goes to the Durable Object, which broadcasts a `core.record_change` to
+every connected client whose RBAC allows reading that row; every other
+mounted `useQuery` for that collection updates its local state and
+re-renders. Practice drawing this as a diagram: Browser A → DO → broadcast
+→ Browser B's existing subscription — three arrows, no "polling" or
+"refresh" anywhere in it.
+
+**3. How authorization is enforced, and how you'd prove it live.** Two
+layers: schema-level `permissions` (checked in the DO before data reaches
+a socket) and the one additional narrowing (`delete: 'own'`). If asked to
+prove it live rather than describe it: open two browser profiles, sign in
+as two different accounts, have one create a case, and try to delete it
+from the other — the button won't even be there (UI), but the stronger
+answer is to open devtools and note that even a fabricated delete request
+over the socket gets refused server-side (this is literally what
+`tests/api.spec.ts`'s RBAC tests do, just in Playwright instead of
+devtools).
+
+### Coding exercise for this phase
+
+Implement the "reopen note" feature described in
+`docs/CODE_WALKTHROUGH.md`'s practice exercise for this feature: when a
+case's status changes from `resolved`/`false_positive` back to
+`open`/`investigating`, automatically create a `caseNotes` row saying who
+reopened it. Constraints to work within:
+
+- Don't add a new server action unless you can articulate why the existing
+  client-side `put` isn't enough on its own (it probably is — this is a
+  "call `createConfirmed` right after `put` resolves" problem, not a
+  multi-collection-orchestration problem, which is exactly the judgment
+  call the "one server action, not a blanket policy" principle is testing).
+- Write at least one test: reopening a resolved case adds exactly one new
+  note, and resolving an already-open case does NOT add one (the
+  transition direction matters, not just "status changed").
+- Verify by hand in the running app, not just by reading your own code: a
+  case you resolve, then reopen, should show the system note in its thread
+  without a page refresh.
+
 ## Day 1 learning session (~20-25 min)
 
 Read this once, then close the laptop and try to explain it to someone

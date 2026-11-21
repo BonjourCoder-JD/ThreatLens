@@ -12,6 +12,8 @@ import { useMemo, useState } from 'react'
 import { useQuery } from 'deepspace'
 import {
   Badge,
+  Button,
+  Checkbox,
   EmptyState,
   Modal,
   Select,
@@ -25,7 +27,8 @@ import {
   StatCard,
 } from '@/components/ui'
 import { ActivityChart, RuleDistributionChart, type DayBucket, type RuleCount } from '@/components/charts'
-import { RULE_WEIGHTS } from '@/lib/anomaly-detection'
+import { EventReasons, RuleReference } from '@/components/EventReasons'
+import { CreateCaseModal } from '@/components/CreateCaseModal'
 
 interface AuthEventRecord {
   timestamp: number
@@ -74,6 +77,17 @@ export default function DashboardPage() {
   const [actorSearch, setActorSearch] = useState('')
   const [sortMode, setSortMode] = useState<SortMode>('time')
   const [selected, setSelected] = useState<(typeof records)[number] | null>(null)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [creatingCaseFor, setCreatingCaseFor] = useState<string[] | null>(null)
+
+  function toggleSelected(recordId: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(recordId)) next.delete(recordId)
+      else next.add(recordId)
+      return next
+    })
+  }
 
   // --- Alert summary: computed over the FULL dataset, independent of the
   // filters below, so it always answers "what's the state of the world"
@@ -246,9 +260,20 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        <p className="mb-2 text-xs text-muted-foreground" data-testid="result-count">
-          Showing {filtered.length} of {records.length} events
-        </p>
+        <div className="mb-2 flex items-center justify-between">
+          <p className="text-xs text-muted-foreground" data-testid="result-count">
+            Showing {filtered.length} of {records.length} events
+          </p>
+          {selectedIds.size > 0 && (
+            <Button
+              size="sm"
+              data-testid="open-case-from-selection"
+              onClick={() => setCreatingCaseFor([...selectedIds])}
+            >
+              Open case from {selectedIds.size} selected
+            </Button>
+          )}
+        </div>
 
         {filtered.length === 0 ? (
           <EmptyState title="No events match these filters" description="Try widening the filters above." />
@@ -257,6 +282,7 @@ export default function DashboardPage() {
             <table className="w-full text-left text-sm">
               <thead className="bg-muted/60 text-xs text-muted-foreground">
                 <tr>
+                  <th className="w-8 px-3 py-2" aria-label="Select" />
                   <th className="px-3 py-2">Time</th>
                   <th className="px-3 py-2">Actor</th>
                   <th className="px-3 py-2">Type</th>
@@ -278,6 +304,14 @@ export default function DashboardPage() {
                       onClick={() => setSelected(r)}
                       className="cursor-pointer border-t border-border hover:bg-card/60"
                     >
+                      <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
+                        <Checkbox
+                          data-testid="event-row-select"
+                          checked={selectedIds.has(r.recordId)}
+                          onCheckedChange={() => toggleSelected(r.recordId)}
+                          aria-label={`Select event from ${r.data.actorId}`}
+                        />
+                      </td>
                       <td className="px-3 py-2 whitespace-nowrap text-muted-foreground">
                         {formatTimestamp(r.data.timestamp)}
                       </td>
@@ -321,6 +355,16 @@ export default function DashboardPage() {
             </Modal.Description>
           </Modal.Header>
           <Modal.Body>
+            <div className="mb-4 flex justify-end">
+              <Button
+                size="sm"
+                variant="secondary"
+                data-testid="open-case-from-event"
+                onClick={() => setCreatingCaseFor([selected.recordId])}
+              >
+                Open case from this event
+              </Button>
+            </div>
             <dl className="grid grid-cols-2 gap-3 text-sm">
               <div>
                 <dt className="text-muted-foreground">Source IP</dt>
@@ -348,37 +392,22 @@ export default function DashboardPage() {
 
             <div className="mt-5">
               <h3 className="mb-2 text-sm font-semibold">Why this was flagged</h3>
-              {(selected.data.statReasons ?? []).length === 0 ? (
-                <p className="text-sm text-muted-foreground">
-                  No statistical rule matched this event, or scores haven't been computed yet (an admin runs
-                  "Recompute statistical scores" from the Admin page).
-                </p>
-              ) : (
-                <ul className="space-y-1.5" data-testid="detail-reasons">
-                  {(selected.data.statReasons ?? []).map((reason) => (
-                    <li key={reason} className="rounded-md border border-border bg-card px-3 py-2 text-sm">
-                      {reason}
-                    </li>
-                  ))}
-                </ul>
-              )}
+              <EventReasons reasons={selected.data.statReasons ?? []} />
             </div>
 
-            <div className="mt-5 border-t border-border pt-4">
-              <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                Detection rule reference
-              </h3>
-              <ul className="space-y-1 text-xs text-muted-foreground" data-testid="rule-reference">
-                {RULE_WEIGHTS.map((rule) => (
-                  <li key={rule.label}>
-                    <span className="font-medium text-foreground">{rule.label}</span> (+{rule.weight.toFixed(1)}):{' '}
-                    {rule.threshold}
-                  </li>
-                ))}
-              </ul>
-            </div>
+            <RuleReference />
           </Modal.Body>
         </Modal>
+      )}
+
+      {creatingCaseFor && (
+        <CreateCaseModal
+          eventIds={creatingCaseFor}
+          onClose={() => {
+            setCreatingCaseFor(null)
+            setSelectedIds(new Set())
+          }}
+        />
       )}
     </div>
   )

@@ -15,7 +15,7 @@
 import { useState, useEffect } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { AuthOverlay, useAuthProfileReady, signOut } from 'deepspace'
-import { ChevronDown, LogOut, Menu, X, ShieldCheck, Home as HomeIcon, LayoutDashboard, Settings as SettingsIcon, UserCog } from 'lucide-react'
+import { ChevronDown, LogOut, Menu, X, ShieldCheck, Home as HomeIcon, LayoutDashboard, Settings as SettingsIcon, UserCog, FolderOpen } from 'lucide-react'
 import { APP_NAME } from '../constants'
 import type { Role } from '../constants'
 import { nav } from '../nav'
@@ -37,6 +37,7 @@ import {
 const NAV_ICONS: Record<string, typeof HomeIcon> = {
   '/home': HomeIcon,
   '/dashboard': LayoutDashboard,
+  '/cases': FolderOpen,
   '/settings': SettingsIcon,
   '/admin': UserCog,
 }

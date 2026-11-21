@@ -119,6 +119,30 @@ test.describe('Dashboard', () => {
 })
 
 /**
+ * Cases — list and detail pages, visible to every signed-in analyst (not
+ * admin-gated). The full create/update/notes/sync workflow is covered end
+ * to end in collab.spec.ts with two real analysts; these two are just the
+ * page-load contract per the testing guide's extension checklist.
+ */
+test.describe('Cases', () => {
+  dsTest('cases list loads with real content', async ({ users }) => {
+    const [analyst] = await users(1)
+    await analyst.page.goto('/cases')
+    // Either real cases exist (a row renders) or none do (the empty state
+    // renders) — either way, real content, never a blank page.
+    await dsExpect(
+      analyst.page.getByTestId('cases-list').or(analyst.page.getByText('No cases yet')),
+    ).toBeVisible({ timeout: 15_000 })
+  })
+
+  dsTest('an unknown case id shows "not found," not a crash', async ({ users }) => {
+    const [analyst] = await users(1)
+    await analyst.page.goto('/cases/does-not-exist')
+    await dsExpect(analyst.page.getByText('Case not found')).toBeVisible({ timeout: 15_000 })
+  })
+})
+
+/**
  * Admin page gating — a signed-in, non-admin analyst must never see the
  * data-management controls. This is the UI half of the requirement that
  * admin-only operations are enforced server-side (worker.ts's

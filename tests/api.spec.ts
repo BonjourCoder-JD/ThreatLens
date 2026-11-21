@@ -104,3 +104,112 @@ dsTest.describe('Job room direct-API authorization', () => {
     },
   )
 })
+
+/**
+ * Case RBAC, verified by real behavior rather than an assumed error
+ * message: a non-owner analyst's raw WebSocket delete attempt is sent
+ * directly (bypassing the UI, which doesn't even show a delete button to
+ * a non-owner), and the proof is that the case still exists afterward — an
+ * independent re-query, not just "no success message arrived." A second,
+ * separate check confirms an anonymous visitor's `useQuery('cases')` never
+ * receives a case that's known to exist, which is the schema's `'*': {
+ * read: false }` rule (src/schemas/cases-schema.ts) being enforced in the
+ * Durable Object before data ever reaches the socket — see
+ * docs/concepts/permissions in the DeepSpace docs for why that's a
+ * stronger guarantee than a client-side filter.
+ */
+dsTest.describe('Case RBAC', () => {
+  dsTest('a non-owner analyst cannot delete another analyst\'s case over the raw WebSocket', async ({ users }) => {
+    const [owner, other] = await users(2)
+    const title = `__test-${Date.now()}__ RBAC delete target`
+
+    await owner.page.goto('/dashboard')
+    await owner.page.getByTestId('filter-flagged-only').click()
+    await dsExpect(owner.page.getByTestId('event-row').first()).toBeVisible({ timeout: 15_000 })
+    await owner.page.getByTestId('event-row-select').first().click()
+    await owner.page.getByTestId('open-case-from-selection').click()
+    await owner.page.getByTestId('case-title-input').fill(title)
+    await owner.page.getByTestId('create-case-submit').click()
+    await dsExpect(owner.page).toHaveURL(/\/cases\/.+/, { timeout: 15_000 })
+    const caseId = owner.page.url().split('/cases/')[1]
+
+    try {
+      await other.page.goto('/home')
+      const tokenRes = await other.page.request.post('/api/auth/token')
+      const { token } = (await tokenRes.json()) as { token?: string }
+
+      await other.page.evaluate(
+        async ({ token, roomId, caseId }) => {
+          await new Promise<void>((resolve) => {
+            const ws = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/ws/${roomId}?token=${token}`)
+            ws.onopen = () => {
+              ws.send(JSON.stringify({ type: 'core.delete', payload: { collection: 'cases', recordId: caseId } }))
+              setTimeout(() => {
+                ws.close()
+                resolve()
+              }, 1500)
+            }
+            ws.onerror = () => resolve()
+          })
+        },
+        { token, roomId: jobRoomId(), caseId },
+      )
+
+      // Independent re-query: reload the owner's case list and confirm the
+      // case is still there. This is the actual behavior, not a message guess.
+      await owner.page.reload()
+      await dsExpect(owner.page.getByText(title)).toBeVisible({ timeout: 15_000 })
+    } finally {
+      // See the comment on the equivalent cleanup in collab.spec.ts — an
+      // instant isVisible() check races the page's data load and silently
+      // skips deletion; wait for a real loaded-page signal first.
+      try {
+        await owner.page.goto(`/cases/${caseId}`)
+        await owner.page.getByTestId('case-status-select').waitFor({ state: 'visible', timeout: 10_000 })
+        const deleteButton = owner.page.getByRole('button', { name: 'Delete case' })
+        if (await deleteButton.count()) {
+          await deleteButton.click()
+          await owner.page.getByRole('button', { name: 'Delete', exact: true }).click()
+        }
+      } catch {
+        // Best-effort cleanup — never let it mask the test's own result.
+      }
+    }
+  })
+
+  dsTest('an anonymous visitor never receives a case that exists', async ({ users, browser }) => {
+    const [owner] = await users(1)
+    const title = `__test-${Date.now()}__ RBAC anon target`
+
+    await owner.page.goto('/dashboard')
+    await owner.page.getByTestId('filter-flagged-only').click()
+    await dsExpect(owner.page.getByTestId('event-row').first()).toBeVisible({ timeout: 15_000 })
+    await owner.page.getByTestId('event-row-select').first().click()
+    await owner.page.getByTestId('open-case-from-selection').click()
+    await owner.page.getByTestId('case-title-input').fill(title)
+    await owner.page.getByTestId('create-case-submit').click()
+    await dsExpect(owner.page).toHaveURL(/\/cases\/.+/, { timeout: 15_000 })
+    const caseId = owner.page.url().split('/cases/')[1]
+
+    try {
+      const anonContext = await browser.newContext()
+      const anonPage = await anonContext.newPage()
+      await anonPage.goto('/cases')
+      await anonPage.waitForTimeout(2000) // let any subscription settle
+      await dsExpect(anonPage.getByText(title)).toHaveCount(0)
+      await anonContext.close()
+    } finally {
+      try {
+        await owner.page.goto(`/cases/${caseId}`)
+        await owner.page.getByTestId('case-status-select').waitFor({ state: 'visible', timeout: 10_000 })
+        const deleteButton = owner.page.getByRole('button', { name: 'Delete case' })
+        if (await deleteButton.count()) {
+          await deleteButton.click()
+          await owner.page.getByRole('button', { name: 'Delete', exact: true }).click()
+        }
+      } catch {
+        // Best-effort cleanup — never let it mask the test's own result.
+      }
+    }
+  })
+})

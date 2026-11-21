@@ -1,6 +1,6 @@
 # ThreatLens — Architecture
 
-Living document. Updated at the end of each build day. Last updated: **Day 2 (post-redesign, P0 roadmap Phase 1)**.
+Living document. Updated at the end of each build day. Last updated: **P0 roadmap Phase 2 (case investigation workflow)**.
 
 ## Submission roadmap (tracked — updated after every phase)
 
@@ -11,15 +11,97 @@ independent and substantial; #4 needs final screenshots, so it's last.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | Better statistical explanations | **Done.** Thresholds now embedded in every reason string (generated from the real constants, not retyped) plus a durable "Detection rule reference" panel on the dashboard; explanation-correctness tests added. |
-| 3 | Case investigation workflow | **Not started** (schema only, from Day 1). Next up. |
-| 5 | Royal-blue UI | **Mostly done** (dashboard + admin). Blocked from "complete" only by #3 — no case screens exist yet to style. |
-| 2 | ML evaluation (precision/recall) | **Not started.** |
+| 1 | Better statistical explanations | **Done.** Thresholds embedded in every reason string plus a durable "Detection rule reference" panel; explanation-correctness tests added. |
+| 3 | Case investigation workflow | **Done.** Create-from-event(s), status/priority/assignment, chronological notes, real-time sync — verified with two real signed-in analysts, not mocked. Full detail below. |
+| 5 | Royal-blue UI | **Done.** Dashboard, admin, and the new case list/detail screens all share the same theme tokens and components; responsive and accessible (verified Day 2). |
+| 2 | ML evaluation (precision/recall) | **Not started.** Next up. |
 | 4 | README + architecture diagram | **Not started.** Deliberately last — needs the finished UI for screenshots. |
 
 See `docs/DEBUGGING_LOG.md` for what was actually verified at each step —
 this table tracks scope, not proof; don't treat "Done" here as a
 substitute for that log's verification trail.
+
+## Phase 2: the case investigation workflow
+
+Collaborative investigation, built entirely on the `cases`/`caseNotes`
+schemas locked in on Day 1 — no schema migration was needed, which is
+exactly what that early design work was for.
+
+**Data flow, end to end** (also see `docs/CODE_WALKTHROUGH.md` for the
+file-level walkthrough and `docs/INTERVIEW_PREP.md` for how to explain this
+live):
+
+1. An analyst selects one or more event rows on `/dashboard` (checkboxes)
+   or opens a single event's detail and clicks "Open case from this
+   event."
+2. The `CreateCaseModal` collects a title (required) and optional summary,
+   then calls the `createCaseFromEvents` **server action**
+   (`src/actions/case-actions.ts`) — chosen deliberately over a direct
+   client `useMutations('cases').create(...)` because opening a case
+   should also leave an audit-trail note recording which events it came
+   from, and that's two collection writes the server-actions guide
+   specifically calls "orchestrate writes across multiple collections" for.
+3. The action validates the input (non-empty title, 1-25 event ids),
+   creates the `cases` row, then creates an initial `caseNotes` row — both
+   attributed to the real calling analyst (`ctx.userId`), not the app
+   owner, because `callerJwt`/`userId` flow through the verified caller's
+   JWT, not a job's owner identity.
+4. The client is redirected to `/cases/:id`, which resolves the id against
+   a broadly-fetched `useQuery('cases', ...)` (same "fetch broad, filter
+   client-side" pattern as the dashboard) and renders status/priority/
+   assignment controls, the linked events (resolved against `authEvents`
+   the same way), and the note thread.
+5. Status/priority/assignment edits are **plain client mutations**
+   (`useMutations('cases').put(...)`) — no server action needed, because
+   the `cases` schema already grants `member: update: true` directly.
+   Notes use `createConfirmed` so a rejection surfaces as a real error, not
+   a silent no-op.
+
+**How real-time sync actually works here.** Every page on this workflow
+uses `useQuery`, which — per `docs/concepts/realtime-sync` — opens one
+WebSocket per `RecordScope` and keeps every subscribed client's local
+store in sync via `core.record_change` broadcasts from the Durable Object.
+There is no polling and no manual "refetch" anywhere in this feature: when
+analyst A calls `put`/`createConfirmed`, the **server** broadcasts the
+change to every other connected client whose RBAC allows reading that row,
+and analyst B's already-mounted `useQuery('cases', ...)` / `useQuery
+('caseNotes', ...)` subscriptions update their local state automatically,
+re-rendering React. This was verified with two real, independently
+signed-in Playwright browser contexts (`tests/collab.spec.ts`) — not two
+assertions against one mocked store.
+
+**How authorization is actually enforced.** Two independent layers, proven
+with real behavior rather than assumed:
+
+- **Read**: `cases`/`caseNotes` deny `'*'` and `viewer` entirely in their
+  schema permissions (Day 1). An anonymous visitor's `useQuery('cases')`
+  receives zero rows — not a client-side-hidden list, a server-side-empty
+  one. Verified: `tests/api.spec.ts`, "an anonymous visitor never receives
+  a case that exists" creates a real case as one analyst, then opens a
+  genuinely unauthenticated browser context and confirms the title never
+  arrives.
+- **Delete**: `member: delete: 'own'` means only a case's creator (or an
+  admin) can delete it. Verified at the wire-protocol level, not the UI:
+  `tests/api.spec.ts`'s other RBAC test signs in as a **different**
+  analyst, opens a raw WebSocket, sends the exact `core.delete` message the
+  SDK would send, and then independently re-queries to confirm the case
+  **still exists** — proving the server refused the write, not just that
+  the UI never offered a delete button to a non-owner (it doesn't, but
+  that's convenience, not the boundary).
+
+**Design decisions worth being able to defend:**
+- Any analyst can create a case from any event, and any analyst can edit
+  any case's status/priority/assignment — this is a small, shared-queue
+  team tool (Day 1's decision), not a per-analyst silo. Delete is the one
+  operation narrowed to the creator (or admin), because deletion is
+  destructive and the others aren't.
+- The case detail page resolves `relatedEventIds` and the case itself by
+  fetching broadly and filtering client-side, rather than relying on
+  `where: { recordId: id }` — consistent with the dashboard's established
+  pattern, and avoids depending on client-`where` envelope-field support
+  that was never explicitly confirmed for the client query path (it IS
+  confirmed for server-side `ActionTools.query`, which is a different code
+  path).
 
 ## What this app is
 
