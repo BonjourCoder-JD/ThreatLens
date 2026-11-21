@@ -30,5 +30,17 @@ export default defineConfig({
     // Unit tests only; tests/*.spec.ts are Playwright suites run separately.
     include: ['prerender.test.ts', 'src/**/*.{test,spec}.{ts,tsx}'],
     environment: 'node',
+    // The default 'threads'/'forks' pools spawn real OS worker threads or
+    // child processes to isolate each test file. In this sandboxed dev
+    // container that isolation silently breaks: the worker never receives
+    // its init message, so `describe()` runs with no runner context and
+    // throws "Cannot read properties of undefined (reading 'config')" (or,
+    // on some vitest versions, silently registers zero tests). `vmThreads`
+    // isolates each file in a V8 vm context inside the *same* thread
+    // instead of a separate OS thread/process, which sidesteps whatever is
+    // broken here. See docs/DEBUGGING_LOG.md ("Vitest unit-test runner")
+    // for the full investigation — this is a sandbox-specific workaround,
+    // not a vitest bug fix, and may not be needed on a normal machine.
+    pool: 'vmThreads',
   },
 })

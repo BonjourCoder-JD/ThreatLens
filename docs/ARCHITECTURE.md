@@ -166,7 +166,11 @@ forced into Day 1.
   (no bulk-insert API is exposed by the SDK). Fine at 1,000 rows; at much
   larger counts this would need chunked/parallel writes or a different
   strategy — a known, documented tradeoff, not an oversight.
-- **Vitest unit-test runner is currently broken in this environment**
-  (unrelated to this app's code — see `docs/DEBUGGING_LOG.md`). The
-  project's primary, documented test contract (`npx deepspace test run`,
-  Playwright-based) is unaffected and passing.
+- **Vitest unit-test runner needed a sandbox-specific pool setting**
+  (`pool: 'vmThreads'` in `vitest.config.ts`) — the default pool spawns real
+  OS worker threads/processes for test isolation, which didn't complete
+  their handshake in this dev container. Fixed Day 2; see
+  `docs/DEBUGGING_LOG.md` for the full investigation. One pre-existing,
+  unrelated test (`src/prerender-entry.test.tsx`) now fails for a genuine
+  reason (likely two React instances under `vmThreads`) that was previously
+  masked — left open, not silently patched over.

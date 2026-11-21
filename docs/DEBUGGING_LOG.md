@@ -117,7 +117,7 @@ without a test failing.
 
 ---
 
-## Day 1 — Incident 3 (unresolved, deferred): Vitest unit-test runner fails on every spec
+## Day 2 — Incident 3 (resolved): Vitest unit-test runner fails on every spec
 
 **Error observed.** Every `.test.ts` file — including the two pre-existing
 scaffold tests I never touched (`prerender.test.ts`,
@@ -154,17 +154,54 @@ installed by more than one package manager at different times.
   contract: `npx deepspace test run smoke` (Playwright) ran cleanly,
   7/7 passing, in the same environment, same `node_modules`.
 
-**Fix.** Not yet applied — deliberately. I didn't want to guess at a version
-pin (e.g. downgrading `vite` or `vitest`) without being asked to change
-dependency versions, since that's a meaningful, somewhat risky edit on its
-own and the root cause isn't confirmed yet.
+**Further investigation (Day 2, time-boxed to ~55 min).** Ruled out, in
+order, each with a concrete test:
+1. *Project config.* Reproduced with a one-line `.test.ts` containing only
+   `describe('x', () => it('y', () => expect(1+1).toBe(2)))` — no project
+   imports. Reproduced again with the most minimal possible
+   `vitest.config.ts` (just `test.include`, nothing else). Both failed
+   identically → not caused by `appIdDefine`, aliasing, or any project
+   setting.
+2. *Stale dep-optimization cache.* Deleted `node_modules/.vite` and
+   `node_modules/.vite-temp` entirely. Same failure → not a cache issue.
+3. *Corrupted/mismatched install.* `npm ls vitest` showed one deduped
+   `vitest@4.1.12` and matching `@vitest/*` siblings everywhere — no
+   version split. A full `rm -rf node_modules && npm ci` reproduced the
+   identical error byte-for-byte → not an install-corruption issue.
+4. *Vitest version regression.* Installed `vitest@4.0.18` (last 4.0.x)
+   instead of `4.1.12`. The error **changed** — from the `TypeError` to
+   `Error: No test suite found in file` — proving the symptom is
+   version-sensitive, but not actually fixed.
+5. *Pool/isolation mechanism.* Tried `--pool=forks` (same `TypeError` as the
+   default `threads` pool). Tried `--pool=vmThreads` — **passed.** Tried
+   `--pool=vmForks` on 4.1.12 after reverting the version change — also
+   passed, and the *original, untouched* `vitest@4.1.12` passes fine under
+   either vm-based pool.
 
-**Current status / next step.** Deferred to Day 2 triage. Next things to
-try, in order: (1) `npx deepspace@latest app update --json` to see if the
-scaffold has a known toolchain-version migration for this; (2) isolate
-further by creating a throwaway one-line `.test.ts` with no imports beyond
-`vitest` itself, outside `src/`, to see if the failure is specific to the
-project's `vitest.config.ts` (which injects a custom `define` via
-`appIdDefine`) or truly global. **Does not block Day 1 or Day 2 work** —
-the project's real test contract (Playwright via `deepspace test run`) is
-unaffected.
+**Root cause.** The default `threads`/`forks` pools isolate each test file
+by spawning a real OS-level worker thread or child process, and that
+spawned worker never completes its handshake with the parent in this
+sandboxed dev container — so `describe()` runs with no runner context
+installed at all. `vmThreads`/`vmForks` isolate each file in a V8 `vm`
+context inside the *existing* thread/process instead of spawning a new
+OS-level one, which sidesteps whatever is broken in this environment's
+thread/process spawning. This is an environment limitation, not a bug in
+the project's code or in Vitest itself — the same install works under the
+default pool on an unrestricted machine.
+
+**Fix.** One line in `vitest.config.ts`: `test: { pool: 'vmThreads' }`, with
+a comment explaining why (see the file). No dependency version was
+changed — the original `vitest@4.1.10` range in `package.json` is untouched,
+reinstalled clean, and confirmed fixed.
+
+**Test result.** `npm run test:unit`: **7 of 8 tests now pass** (previously
+0 of any test could even be collected). The 8th —
+`src/prerender-entry.test.tsx` — now fails with a *different*, genuine
+error ("Invalid hook call" / two React instances) that was always there but
+invisible, because the collection-phase crash fired before that test's body
+ever ran. This is a separate, pre-existing bug in the scaffold's own
+prerender test, unrelated to the Vitest-runner fix or anything built in
+ThreatLens — left open deliberately rather than scope-creeping into a
+second investigation; flagged to the user rather than silently chased or
+silently ignored. `npm run type-check`, `npm run lint`, and the full
+Playwright smoke suite (7/7) were re-confirmed passing after this change.
