@@ -195,15 +195,59 @@ not just admins — `src/nav.ts` has no `roles` restriction on it, unlike
 visitors at the schema level (`'*': { read: false }`), so this doesn't
 widen who can see the data, only confirms every signed-in `member` can.
 
-**Honest testing boundary.** The dashboard's filter bar and summary cards
-only render once at least one `authEvents` row exists. As of Day 2, this
-dev database is still empty — the admin import happy path is reserved for
-the user to verify personally (see `docs/DEBUGGING_LOG.md` /
-the Day 2 report), so the dashboard's richer behavior (real flagged rows,
-non-empty filters) hasn't been exercised against real data yet either. What
-*is* tested, thoroughly, is the detection engine itself — directly against
-the real canonical dataset, including cross-validation against its
-ground-truth labels (see `docs/CODE_WALKTHROUGH.md`).
+**Owner-verified (Day 2, post-report): the admin happy path actually
+works.** The user personally signed in with the real owner account and ran
+the checks this document previously left open:
+
+- Import synthetic events, twice in a row: both succeeded, 1,000 imported
+  each time, **final count stayed at exactly 1,000** — the upsert-by-
+  `eventId` idempotency claim holds against a real second run, not just
+  against unit tests.
+- Recompute statistical scores: succeeded, **48 of 1,000 events flagged.**
+
+Full detail in `docs/DEBUGGING_LOG.md`. **Still open:** the dashboard UI
+itself has not yet been verified against this real, now-populated data by
+the user — that check is explicitly reserved for them and is not claimed
+complete here. For what it's worth: while self-checking the Day 2 UI
+redesign below, I (the agent) took screenshots signed in as a non-admin
+test account and incidentally observed the dashboard rendering correctly
+against this same real data (1,000 events, 48 flagged, 16/16/17 per-rule
+counts — matching what the user reported). That's a good sign, and it's
+how a real chart rendering bug was caught and fixed (see
+`docs/DEBUGGING_LOG.md`), but it is an agent observation, not the user's
+own verification, and isn't a substitute for it.
+
+## Day 2 (continued): the royal-blue design system
+
+The app's visual design is implemented entirely through DeepSpace's
+sanctioned theming mechanism — a new `[data-theme="threatlens"]` block in
+`src/themes.css` (registered in `src/themes.ts`, activated via
+`<html data-theme="threatlens">` in `index.html`) — not ad-hoc hex values
+scattered through components. Every color is a CSS custom property
+(`--color-background`, `--color-primary`, `--color-shell`, etc.); components
+reference the generated Tailwind utilities (`bg-card`, `text-primary`,
+`bg-shell`) so the whole app re-themes from one file.
+
+- **`--color-shell`/`--color-shell-panel`** (royal blue / white) drive the
+  sidebar chrome vs. the main content panel — this is the SDK's own
+  documented mechanism for "the area behind a multi-panel layout" vs. "the
+  raised surface a page renders into," not a new concept introduced for
+  this palette.
+- **`src/components/Navigation.tsx`** was restructured from a horizontal
+  top bar into a vertical sidebar (collapsing to a mobile top bar + drawer
+  below the `md` breakpoint). Every `data-testid` the existing Playwright
+  suite depends on (`app-navigation`, `nav-sign-in-button`, `nav-user-name`,
+  `nav-user-email`, the `Account menu` accessible name) is unchanged — only
+  the layout changed, not the contract, and the full suite still passes.
+- **`src/components/ui/StatCard.tsx`** and **`src/components/charts.tsx`**
+  (`ActivityChart`, `RuleDistributionChart`) are new, shared, reusable
+  components — used by both the dashboard and the admin page, per the
+  "shared design tokens and reusable components" requirement. The charts
+  are plain CSS/flex, not a new charting dependency — justified in
+  `docs/CODE_WALKTHROUGH.md`.
+- **No chart or stat value is invented.** Every number on the dashboard and
+  in both charts is derived from the same `authEvents` records the table
+  below renders — there is no separate "demo data" path.
 
 ## Known risks / limitations (living list)
 

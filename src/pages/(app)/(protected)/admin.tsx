@@ -13,7 +13,7 @@ import { useJobs, useUser } from 'deepspace'
 import { useQuery } from 'deepspace'
 import type { JobView } from 'deepspace'
 import type { ReactNode } from 'react'
-import { Button, Badge, EmptyState } from '@/components/ui'
+import { Button, Badge, EmptyState, StatCard } from '@/components/ui'
 import { SCOPE_ID } from '../../../constants'
 
 interface ImportResult {
@@ -70,14 +70,19 @@ export default function AdminPage() {
   return (
     <div className="min-h-full text-foreground">
       <div className="mx-auto max-w-3xl px-6 py-20">
-        <h1 className="mb-2 text-4xl font-bold tracking-tight">Admin</h1>
-        <p className="mb-12 text-sm text-muted-foreground">
+        <h1 className="mb-2 text-4xl font-bold tracking-tight text-foreground">Admin</h1>
+        <p className="mb-8 text-sm text-muted-foreground">
           Data-management operations for ThreatLens. Every action here is enforced server-side
           for the admin role, not just hidden in this UI.
         </p>
 
-        <section className="mb-6 rounded-lg border border-border bg-card p-6">
-          <h2 className="mb-1 text-lg font-semibold">Synthetic auth log dataset</h2>
+        <div className="mb-8 grid grid-cols-2 gap-3">
+          <StatCard label="Events in authEvents" value={authEvents.length} />
+          <StatCard label="Currently flagged" value={flaggedCount} tone="alert" />
+        </div>
+
+        <section className="mb-6 rounded-xl border border-border bg-card p-6 shadow-[0_1px_3px_0_rgba(23,37,84,0.08)]">
+          <h2 className="mb-1 text-lg font-semibold text-card-foreground">Synthetic auth log dataset</h2>
           <p className="mb-4 text-sm text-muted-foreground">
             Loads the canonical dataset (<code>scripts/generate-dataset.mjs</code>) into the{' '}
             <code>authEvents</code> collection. Safe to re-run — each row upserts by its stable
@@ -96,8 +101,8 @@ export default function AdminPage() {
           <JobList jobs={importJobs} testId="import-job-row" renderResult={renderImportResult} />
         </section>
 
-        <section className="rounded-lg border border-border bg-card p-6">
-          <h2 className="mb-1 text-lg font-semibold">Statistical anomaly detection</h2>
+        <section className="rounded-xl border border-border bg-card p-6 shadow-[0_1px_3px_0_rgba(23,37,84,0.08)]">
+          <h2 className="mb-1 text-lg font-semibold text-card-foreground">Statistical anomaly detection</h2>
           <p className="mb-4 text-sm text-muted-foreground">
             Recomputes <code>statAnomalyScore</code>/<code>statReasons</code> on every row using
             the explainable rules in <code>src/lib/anomaly-detection.ts</code> (failed-login

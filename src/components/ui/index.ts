@@ -34,6 +34,7 @@ export { Tabs, TabsList, TabsTrigger, TabsContent } from './Tabs'
 export { Badge, type BadgeProps } from './Badge'
 export { Avatar, AvatarImage, AvatarFallback } from './Avatar'
 export { EmptyState } from './EmptyState'
+export { StatCard, type StatCardProps } from './StatCard'
 
 /* Feedback */
 export { ToastProvider, useToast } from './Toast'

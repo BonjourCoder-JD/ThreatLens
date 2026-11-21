@@ -73,13 +73,23 @@ test.describe('Smoke tests', () => {
 
 /**
  * Dashboard — visible to every signed-in analyst (unlike /admin, this is
- * NOT role-gated; src/nav.ts has no `roles` on it). Only the empty-state
- * path is testable against this dev database right now: it is genuinely
- * empty until the admin import happy path has been run (see
- * docs/DEBUGGING_LOG.md / the Day 2 report — that verification is reserved
- * for the user, not simulated here). The filter bar and summary cards only
- * render once there's at least one event, so testing them is a follow-up
- * once real data exists — tracked, not silently skipped.
+ * NOT role-gated; src/nav.ts has no `roles` on it).
+ *
+ * This dev database is no longer empty: the user ran the admin import +
+ * recompute happy path themselves (see docs/DEBUGGING_LOG.md), and that
+ * data persists in this checkout's local dev storage. That makes it
+ * possible — and more valuable — to test the dashboard against real,
+ * persisted data instead of only its empty state.
+ *
+ * An earlier version of this spec asserted an empty state via
+ * `getByText(/No events yet|Loading events/)`. That assertion kept passing
+ * even after real data existed, because "Loading events…" is ALSO shown
+ * for a few hundred ms while the query's WebSocket subscription resolves —
+ * the regex matched that transient text, not genuine emptiness, and the
+ * test was giving false confidence. Fixed here by asserting against
+ * `alert-summary` (which only renders for a populated dashboard) and by
+ * reading values from the page rather than hardcoding them, so the test
+ * stays valid as the dataset changes (e.g. once Day 3 adds ML scores).
  */
 test.describe('Dashboard', () => {
   dsTest('non-admin analyst can reach the dashboard and sees the nav link', async ({ users }) => {
@@ -88,10 +98,23 @@ test.describe('Dashboard', () => {
     await dsExpect(analyst.page.getByRole('link', { name: 'Dashboard' })).toBeVisible({ timeout: 15_000 })
   })
 
-  dsTest('dashboard shows an empty state when no events are imported yet', async ({ users }) => {
+  dsTest('dashboard shows real summary counts and the row detail explains a flagged event', async ({ users }) => {
     const [analyst] = await users(1)
     await analyst.page.goto('/dashboard')
-    await dsExpect(analyst.page.getByText(/No events yet|Loading events/)).toBeVisible({ timeout: 15_000 })
+    await dsExpect(analyst.page.getByTestId('alert-summary')).toBeVisible({ timeout: 15_000 })
+
+    // "Flagged only" must shrink the visible result count — proves the
+    // filter is doing real work against real rows, not just rendering.
+    const before = await analyst.page.getByTestId('result-count').innerText()
+    await analyst.page.getByTestId('filter-flagged-only').click()
+    await dsExpect(analyst.page.getByTestId('result-count')).not.toHaveText(before)
+
+    // Open the first flagged row's detail and confirm it lists at least
+    // one concrete, human-readable reason — the explainability contract.
+    await analyst.page.getByTestId('event-row').first().click()
+    await dsExpect(analyst.page.getByTestId('detail-reasons')).toBeVisible()
+    const reasonCount = await analyst.page.getByTestId('detail-reasons').locator('li').count()
+    dsExpect(reasonCount).toBeGreaterThan(0)
   })
 })
 

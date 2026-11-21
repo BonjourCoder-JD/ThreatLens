@@ -16,6 +16,57 @@
  *   4. Switch to it via `data-theme` on <html> in index.html.
  */
 
+/* ThreatLens — the app's real theme. Professional light "security SaaS"
+ * palette: royal blue chrome (sidebar/header), bright blue for interactive
+ * elements, white cards on a light blue-gray canvas, dark navy text.
+ * Status colors (success/warning/destructive) are defined once, globally,
+ * in styles.css's @theme block and intentionally NOT overridden here — the
+ * red/orange/green severity meaning must stay identical across any theme. */
+[data-theme="threatlens"] {
+  color-scheme: light;
+
+  --color-background: #f1f5f9;
+  --color-foreground: #172554;
+  --color-card: #ffffff;
+  --color-card-foreground: #172554;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #172554;
+
+  --color-primary: #2563eb;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #e2e8f0;
+  --color-secondary-foreground: #172554;
+  --color-muted: #e2e8f0;
+  --color-muted-foreground: #64748b;
+  --color-accent: #dbeafe;
+  --color-accent-foreground: #1e3a8a;
+
+  --color-destructive: #dc2626;
+  --color-destructive-foreground: #ffffff;
+
+  --color-border: #e2e8f0;
+  --color-input: #cbd5e1;
+  --color-ring: #2563eb;
+
+  /* Slightly softer corners than the neutral default — reads as a more
+   * polished, modern SaaS surface. */
+  --radius: 0.625rem;
+
+  /* Subtle, Linear/Stripe-style card shadows per the convention documented
+   * in styles.css — new components use the literal arbitrary-value form
+   * (`shadow-[...]`) below rather than the `shadow-card` utility class, for
+   * the same runtime-theme-switch reason starter components do. */
+  --shadow-card: 0 1px 3px 0 rgba(23, 37, 84, 0.08);
+  --shadow-card-hover: 0 4px 12px 0 rgba(23, 37, 84, 0.12);
+
+  /* The sidebar/header chrome (royal blue) vs. the white panel content
+   * renders into — this IS the brand palette's two most prominent colors,
+   * expressed through the SDK's existing shell-token mechanism rather than
+   * a one-off hardcoded color in the sidebar component. */
+  --color-shell: #0b3daa;
+  --color-shell-panel: #ffffff;
+}
+
 /* Paper — light example theme; shows the full token contract incl.
  * `color-scheme: light`. Replace or delete it once the app has its own. */
 [data-theme="paper"] {

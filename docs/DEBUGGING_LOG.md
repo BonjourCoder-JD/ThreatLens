@@ -1,5 +1,120 @@
 # ThreatLens — Debugging Log
 
+## Day 2 (UI redesign) — Incident: a test was silently giving false confidence
+
+**Error observed.** None — this is the dangerous kind. While re-running the
+full Playwright suite after the redesign, `Dashboard › dashboard shows an
+empty state when no events are imported yet` reported **passing**. But I
+had just taken a screenshot, in the same dev database, showing the
+dashboard rendering 1,000 real events (the data from the user's own manual
+verification, which persists in this checkout's local dev storage). A
+"shows an empty state" test should not be able to pass against a database
+that isn't empty.
+
+**Initial hypothesis.** The assertion was
+`getByText(/No events yet|Loading events/)` — a regex with two
+alternatives. My hypothesis: the second alternative, "Loading events…",
+is ALSO shown briefly by the dashboard while `useQuery`'s status is still
+`'loading'`, regardless of whether the underlying data is empty or not —
+so the test could be passing by catching that transient loading text, not
+by observing genuine emptiness.
+
+**Investigation.** Wrote a one-off temporary test
+(`tests/_state-check.spec.ts`, deleted after use) that logged the
+dashboard's actual rendered text. It showed the real populated dashboard —
+"Flagged: 48," "Failed-login bursts: 16," etc. — confirming the database
+is not empty and the "empty state" test's premise no longer held. The
+regex's loading-text alternative was the only way it could still be
+passing.
+
+**Fix.** The underlying scenario (an empty, never-imported database) can
+no longer be exercised against this persisted dev database, so rather than
+patch the assertion to be stricter against a precondition that's no longer
+true here, the test was replaced with one that asserts against the real,
+current, persisted data: the summary renders, toggling "Flagged only"
+measurably changes the visible result count (proving the filter does real
+work, not just renders), and opening a flagged row's detail shows at least
+one concrete reason. Values are read from the page at runtime, not
+hardcoded, so the test stays valid as the dataset changes later (e.g. Day 3
+ML scores).
+
+**Test result.** `npx deepspace test run smoke`: 9/9 passing, including the
+replacement test, run against the real persisted data.
+
+**Why this matters.** A test that passes for the wrong reason is worse
+than no test — it looks like coverage without being any. The lesson:
+a passing assertion with an "or" in it is worth a second look for whether
+either branch could trivially satisfy it regardless of what's actually
+being tested.
+
+---
+
+## Day 2 (UI redesign) — Incident: activity chart rendered as a blank area
+
+**Error observed.** After building the royal-blue redesign, I took a set of
+screenshots (`tests/_visual-check.spec.ts`, deleted afterward — not part of
+the real suite) to self-check the result before reporting it done. The
+"Event activity" chart's plot area was completely blank — just white space
+between the title and the date-range labels — even with 1,000 real events
+loaded.
+
+**Initial hypothesis.** The per-day bar `<div>`s have their height set via
+inline `style={{ height: '${pct}%' }}`, and a CSS percentage height can only
+resolve against an ancestor with a *definite* height. My hypothesis: some
+ancestor in the chain didn't have one.
+
+**Investigation.** Read `src/components/charts.tsx`'s `ActivityChart`: the
+row container had `className="flex items-end gap-1.5"` with an explicit
+pixel height (`style={{ height: rowHeightPx }}`), and each day's column was
+a flex child with no height of its own, relying on the row's default
+cross-axis sizing to stretch it to the full row height. `items-end`
+overrides that default (`stretch`) — it sizes each flex item to its own
+*content* height instead. But the column's content (the percentage-height
+bar) can't compute a height without the column already having one — a
+circular dependency browsers resolve by treating the percentage as
+effectively zero. That's the blank area: every bar was rendering at 0px.
+
+**Fix.** Changed the row's class from `items-end` to `items-stretch` (one
+word). The column now stretches to the row's full 160px, giving the
+percentage-height bar inside it something definite to resolve against; the
+inner `flex flex-col justify-end` still correctly bottom-anchors the
+(now correctly sized) bar within that column.
+
+**Test result.** Re-ran the same screenshot script: bars now render at the
+expected heights, with the red "flagged" sliver visible on top of each
+day's bar, matching the real per-day counts. Confirmed by eye, not just by
+absence of a console error — this bug produced no error of any kind, only
+silently-wrong layout, which is exactly why a visual check (not just
+`tsc`/tests) was necessary before calling the chart "implemented."
+
+---
+
+## Day 2 — Manually observed: admin import/recompute happy path (owner-verified)
+
+Not a bug — recorded here because it's the one verification step this log
+previously flagged as "reserved for the user, not simulated." The user
+personally signed in with the real DeepSpace owner account and ran the
+checks the Day 1/2 reports specified. Results, as reported:
+
+- Admin panel accessible to the owner account.
+- First "Import synthetic events" run: succeeded, 1,000 events imported.
+- Second "Import synthetic events" run (immediately after, no changes in
+  between): succeeded, 1,000 events imported.
+- `authEvents` row count after both runs: **exactly 1,000** — confirms the
+  upsert-by-`eventId` idempotency claim in `docs/ARCHITECTURE.md` actually
+  holds against a real second run, not just in the unit tests and the
+  theory of how `tools.create(..., recordId)` behaves.
+- "Recompute statistical scores" run: succeeded.
+- Statistical detection result: **48 of 1,000 events flagged.**
+
+This confirms the Day 1 import job and the Day 2 recompute job both work
+end-to-end against the real deployed-shape app, under the real owner
+identity, not just in unit tests or empty-state Playwright checks. It does
+**not** yet cover the dashboard UI itself against this real data — that is
+a separate, still-open verification the user has explicitly reserved for
+themselves (not to be marked complete here).
+
+
 Real incidents only, in the order they happened. Nothing here is invented or
 reconstructed after the fact — each entry was written at the time the issue
 was found. Format: error observed → initial hypothesis → investigation →

@@ -854,6 +854,82 @@ changes when you expected it to stay fixed (or vice versa), re-read
 
 ---
 
+## Feature: Royal-blue design system (theme, sidebar, charts)
+
+### What it does and why it exists
+
+Replaces the scaffold's placeholder dark theme with the approved
+professional "security SaaS" look, implemented as real DeepSpace theme
+tokens rather than hardcoded colors, so every page that already used
+`bg-card`/`text-foreground`/etc. re-themed automatically.
+
+### Files, functions, data structures
+
+- `src/themes.css` (`[data-theme="threatlens"]` block), `src/themes.ts`
+  (catalog entry), `index.html` (`data-theme` attribute + first-paint
+  background).
+- `src/components/Navigation.tsx` — rewritten layout (sidebar + mobile
+  drawer), same hooks/testids as before.
+- `src/components/ui/StatCard.tsx` — shared KPI tile.
+- `src/components/charts.tsx` — `ActivityChart` (stacked bar, flagged vs.
+  clean, per day) and `RuleDistributionChart` (labeled horizontal bars per
+  detection rule).
+
+### Design decisions & tradeoffs
+
+- **Charts are hand-built in CSS, not a new dependency.** At two simple
+  shapes (a time-bucketed stacked bar, a short labeled bar list), a
+  charting library would be meaningfully more weight for no real gain —
+  consistent with the brief's "no unnecessary dependencies."
+- **Chart colors reuse existing semantic tokens** (`bg-destructive`,
+  `bg-warning`, `bg-info`) rather than a new arbitrary palette — the same
+  red/orange/blue already mean the same thing elsewhere (score badges), so
+  there's one color vocabulary for severity across the whole app, not two.
+- **The sidebar is one component with two responsive variants**, not two
+  separate components, wrapped in a `display:contents` div carrying the
+  single `data-testid="app-navigation"` — this keeps exactly one DOM
+  element matching that testid regardless of viewport, so existing
+  Playwright locators don't need to pick a variant.
+
+### Likely bugs & how to diagnose them
+
+- **A real one, already hit:** a flex row with `items-end` instead of
+  `items-stretch` silently collapses percentage-height children to zero —
+  no console error, just a blank chart. See `docs/DEBUGGING_LOG.md`. If a
+  future chart or bar-style component renders blank with no error, check
+  the flex `align-items` on its row container first.
+- **Symptom: the sidebar's dropdown menu opens off-screen.** Check
+  `side`/`align` on `DropdownMenuContent` — it's `side="top" align="start"`
+  for the sidebar variant specifically because the trigger sits at the
+  bottom-left of the screen, not the top-right like the old top bar.
+
+### Interview questions you might get, and good answers
+
+- **"Why theme tokens instead of hardcoding the hex values in components?"**
+  → One file controls the whole app's palette; any component written
+  against `bg-card`/`text-foreground` automatically re-themes. Hardcoding
+  `#0B3DAA` directly into a dozen components would mean a future palette
+  change touches a dozen files instead of one.
+- **"Walk me through why the chart was blank, live."** → See the
+  `items-end` vs. `items-stretch` explanation above — a good one to be
+  able to draw as two nested boxes on a whiteboard.
+
+### Practice exercise
+
+Add a dark-mode variant of the `threatlens` theme (a second
+`[data-theme="threatlens-dark"]` block) and a way to toggle it — exercises
+the exact mechanism `sdk-reference/client/theming.md` documents
+(`DeepSpaceThemeProvider`/`useIsDarkTheme`) without touching any component.
+
+### Verifying the modification
+
+`npm run build` (confirms the new CSS compiles), then visually check both
+the dashboard and a narrow (mobile) viewport — this exact class of bug
+(a blank chart, a wrong-sized sidebar) produces no type error and no test
+failure, so a visual check is the only thing that catches it.
+
+---
+
 ## AI-assisted code: how it was verified
 
 Every piece of SDK usage above was checked against the documented contract

@@ -22,7 +22,9 @@ import {
   SearchInput,
   Switch,
   Label,
+  StatCard,
 } from '@/components/ui'
+import { ActivityChart, RuleDistributionChart, type DayBucket, type RuleCount } from '@/components/charts'
 
 interface AuthEventRecord {
   timestamp: number
@@ -59,18 +61,6 @@ function scoreBadgeVariant(score: number): 'secondary' | 'warning' | 'destructiv
   return 'destructive'
 }
 
-/** One summary card showing a count. Pure presentation, no logic. */
-function StatCard({ label, value, tone }: { label: string; value: number; tone?: 'default' | 'alert' }) {
-  return (
-    <div className="rounded-lg border border-border bg-card p-4">
-      <div className={tone === 'alert' && value > 0 ? 'text-2xl font-bold text-destructive' : 'text-2xl font-bold text-foreground'}>
-        {value}
-      </div>
-      <div className="mt-1 text-xs text-muted-foreground">{label}</div>
-    </div>
-  )
-}
-
 export default function DashboardPage() {
   const { records, status } = useQuery<AuthEventRecord>('authEvents', {
     limit: 2000,
@@ -101,6 +91,34 @@ export default function DashboardPage() {
     }
     return { total: records.length, flagged, burst, travel, newDevice }
   }, [records])
+
+  // --- Charts: both computed from the SAME `records` the table renders —
+  // nothing here is invented or sampled separately. ---
+  const dayBuckets = useMemo<DayBucket[]>(() => {
+    const byDay = new Map<string, { total: number; flagged: number }>()
+    for (const r of records) {
+      const dayKey = new Date(r.data.timestamp * 1000).toISOString().slice(0, 10)
+      const bucket = byDay.get(dayKey) ?? { total: 0, flagged: 0 }
+      bucket.total += 1
+      if ((r.data.statReasons?.length ?? 0) > 0) bucket.flagged += 1
+      byDay.set(dayKey, bucket)
+    }
+    const sortedDays = [...byDay.keys()].sort()
+    const lastDays = sortedDays.slice(-14)
+    return lastDays.map((dayKey) => ({
+      label: new Date(`${dayKey}T00:00:00Z`).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+      ...byDay.get(dayKey)!,
+    }))
+  }, [records])
+
+  const ruleCounts = useMemo<RuleCount[]>(
+    () => [
+      { label: 'Failed-login burst', count: summary.burst, colorClassName: 'bg-destructive' },
+      { label: 'Impossible travel', count: summary.travel, colorClassName: 'bg-warning' },
+      { label: 'New device', count: summary.newDevice, colorClassName: 'bg-info' },
+    ],
+    [summary],
+  )
 
   const filtered = useMemo(() => {
     let rows = records
@@ -139,13 +157,13 @@ export default function DashboardPage() {
   return (
     <div className="min-h-full text-foreground">
       <div className="mx-auto max-w-6xl px-6 py-12">
-        <h1 className="mb-2 text-4xl font-bold tracking-tight">Dashboard</h1>
+        <h1 className="mb-2 text-4xl font-bold tracking-tight text-foreground">Dashboard</h1>
         <p className="mb-8 text-sm text-muted-foreground">
           Live view of imported authentication events. Scores and reasons come from the
           explainable statistical detector — click any row for the full explanation.
         </p>
 
-        <div className="mb-8 grid grid-cols-2 gap-3 sm:grid-cols-5" data-testid="alert-summary">
+        <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-5" data-testid="alert-summary">
           <StatCard label="Total events" value={summary.total} />
           <StatCard label="Flagged" value={summary.flagged} tone="alert" />
           <StatCard label="Failed-login bursts" value={summary.burst} tone="alert" />
@@ -153,7 +171,26 @@ export default function DashboardPage() {
           <StatCard label="New device" value={summary.newDevice} tone="alert" />
         </div>
 
-        <div className="mb-4 flex flex-wrap items-end gap-4 rounded-lg border border-border bg-card p-4">
+        <div className="mb-6 grid gap-4 lg:grid-cols-2">
+          <div className="rounded-xl border border-border bg-card p-5 shadow-[0_1px_3px_0_rgba(23,37,84,0.08)]">
+            <h2 className="mb-4 text-sm font-semibold text-card-foreground">Event activity (last {dayBuckets.length} days with data)</h2>
+            {dayBuckets.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No dated activity to chart yet.</p>
+            ) : (
+              <ActivityChart data={dayBuckets} />
+            )}
+          </div>
+          <div className="rounded-xl border border-border bg-card p-5 shadow-[0_1px_3px_0_rgba(23,37,84,0.08)]">
+            <h2 className="mb-4 text-sm font-semibold text-card-foreground">Flagged events by rule</h2>
+            {summary.flagged === 0 ? (
+              <p className="text-sm text-muted-foreground">No events are currently flagged.</p>
+            ) : (
+              <RuleDistributionChart rules={ruleCounts} />
+            )}
+          </div>
+        </div>
+
+        <div className="mb-4 flex flex-wrap items-end gap-4 rounded-xl border border-border bg-card p-4 shadow-[0_1px_3px_0_rgba(23,37,84,0.08)]">
           <div className="min-w-[180px]">
             <Label className="mb-1 block text-xs text-muted-foreground">Event type</Label>
             <Select value={eventType} onValueChange={(v) => setEventType(v as EventTypeFilter)}>
@@ -215,9 +252,9 @@ export default function DashboardPage() {
         {filtered.length === 0 ? (
           <EmptyState title="No events match these filters" description="Try widening the filters above." />
         ) : (
-          <div className="overflow-x-auto rounded-lg border border-border">
+          <div className="overflow-x-auto rounded-xl border border-border bg-card shadow-[0_1px_3px_0_rgba(23,37,84,0.08)]">
             <table className="w-full text-left text-sm">
-              <thead className="bg-card text-xs text-muted-foreground">
+              <thead className="bg-muted/60 text-xs text-muted-foreground">
                 <tr>
                   <th className="px-3 py-2">Time</th>
                   <th className="px-3 py-2">Actor</th>
