@@ -525,6 +525,335 @@ automated proof for the UI half today.
 
 ---
 
+## Feature: Explainable statistical anomaly detection (`src/lib/anomaly-detection.ts`, `src/lib/geo.ts`)
+
+### What it does and why it exists
+
+Scores every `authEvents` row with three named, independent rules —
+failed-login burst, impossible travel, new device — and records *why* in
+plain English, not just a number. This is the "live, explainable" half of
+the two-layer detection design (`docs/ARCHITECTURE.md`); the Day 3 offline
+Isolation Forest is the other half, and the two are deliberately never
+mixed into one score.
+
+### Files, functions, data structures
+
+- `src/lib/geo.ts` — `CITY_COORDINATES` (a small hardcoded lat/lon table)
+  and `distanceBetweenCities(a, b)` (haversine great-circle distance).
+- `src/lib/anomaly-detection.ts` — `computeStatScores(events)` is the only
+  export most callers need; internally it groups by `actorId`, sorts each
+  actor's events by time, and runs three private detector functions:
+  `detectFailedLoginBursts`, `detectImpossibleTravel`, `detectNewDevice`.
+  Also exports every threshold (`FAILED_LOGIN_BURST_THRESHOLD`,
+  `IMPOSSIBLE_TRAVEL_MIN_KMH`, etc.) and `RULE_WEIGHTS`, so nothing is a
+  buried magic number.
+
+### Data flow
+
+```
+authEvents rows (from the DB, via the recompute job)
+  → group by actorId → sort each actor's events by timestamp
+  → detectFailedLoginBursts(sorted)   — two-pointer sliding window
+  → detectImpossibleTravel(sorted)    — compare each event to the ONE before it
+  → detectNewDevice(sorted)           — track a running Set of seen devices
+  → merge each event's matched reasons → score = sum of matched weights, capped at 1
+```
+
+### Design decisions & tradeoffs
+
+- **Failed-login burst uses a two-pointer sliding window, not a naive
+  O(n²) scan.** `right` advances through an actor's failed logins one at a
+  time; `left` only ever advances to keep the window within
+  `FAILED_LOGIN_BURST_WINDOW_SECONDS`. This is the standard sliding-window
+  technique — worth being able to draw on a whiteboard live, since it's
+  exactly the kind of thing an interviewer might ask you to re-derive.
+- **Impossible travel compares only to the immediately preceding event**,
+  not to every prior event. Comparing to every prior event would also
+  "catch" the same anomaly multiple times from different anchors and
+  muddies which single comparison is being described in the reason string.
+  Anchoring to the immediate predecessor keeps the explanation exact: "this
+  event, versus the one right before it."
+- **A device, once seen, is seen forever** — switching away and back
+  doesn't re-flag it (tested explicitly: see "does NOT re-flag a device
+  once it has been seen, even after switching away and back"). This models
+  "do you own a second device," not "are you currently using your most
+  recent device."
+- **An actor's very first event is never flagged by the new-device rule.**
+  Without this, *every* actor's first appearance in the dataset would be a
+  guaranteed false positive — there's no prior history to compare against
+  yet. This is the single most important edge case in the whole detector,
+  and it's the first thing tested.
+- **Score is literally `sum(matched rule weights)`, capped at 1.** No
+  model, no calibration, no hidden logic — if `statReasons` has two
+  entries, the score is deterministically the sum of those two rules'
+  weights. An analyst (or an interviewer) can verify the math by hand from
+  the displayed reasons alone.
+- **`geo.ts` is NOT shared with `scripts/generate-dataset.mjs`**, even
+  though both files "know about" cities. The generator only needs "this is
+  home" vs. "this is far" to inject a pattern; the detector needs to
+  measure real distance between *any* two cities an actor used, which is a
+  more general capability. Forcing a shared module across a `.mjs` script
+  (outside the TS build) and a `.ts` library (inside it) would have added
+  real friction for no benefit — the thing that actually proves they agree
+  is the cross-validation test below, not sharing a file.
+
+### DeepSpace SDK capabilities used
+
+None directly — this module is intentionally plain TypeScript with zero
+DeepSpace imports, so it can be unit-tested with nothing but Vitest. The
+*integration* with DeepSpace lives one layer up, in the `recompute-stat-
+scores` job.
+
+### Likely bugs & how to diagnose them
+
+- **Symptom: an event that looks anomalous isn't flagged.** First check
+  which rule you expected to fire and its exact threshold constant (e.g.
+  `IMPOSSIBLE_TRAVEL_MIN_DISTANCE_KM = 300` — two cities closer than that
+  never trigger travel detection regardless of speed). Then check whether
+  the event is actually that actor's *first* event (new-device rule) or
+  whether enough OTHER failed logins exist within the window (burst rule).
+- **Symptom: `distanceBetweenCities` returns `null` unexpectedly.** It
+  returns `null` for any city not in `CITY_COORDINATES` — this will happen
+  immediately if real-world city names are ever introduced without adding
+  them to the table. This is a deliberate fail-closed choice (the caller
+  skips the comparison via `if (distanceKm == null) continue`) rather than
+  guessing a distance.
+- **Symptom: the dashboard shows a score but an empty reasons list, or
+  vice versa.** Should be structurally impossible — `computeScore` only
+  ever sums weights for labels present in `statReasons`. If you see this,
+  something wrote `statAnomalyScore` directly without going through
+  `computeStatScores` (check for a stray manual `tools.update` bypassing
+  the job).
+
+### Interview questions you might get, and good answers
+
+- **"Walk me through the sliding window for failed-login bursts."** → Sort
+  an actor's failed logins by time. Keep two pointers, `left` and `right`.
+  Advance `right` one event at a time; before checking the window size,
+  advance `left` forward (never backward) until the window
+  `[left, right]` fits inside the configured number of seconds. The window
+  size is `right - left + 1`; if that's at least the threshold, every
+  event in `[left, right]` is part of a burst. Because `left` never moves
+  backward, the whole pass over one actor's failed logins is O(n), not
+  O(n²).
+- **"Why cap the score at 1 instead of letting it grow unbounded?"** → A
+  capped, bounded score is easier to display consistently (a progress bar,
+  a 0-1 badge) and easier to reason about when comparing two events — an
+  event matching all three rules isn't "3x worse," it's "matches
+  everything we check for," and the cap reflects that the three rules
+  don't claim to be independently, linearly severity-additive beyond that.
+- **"What's a false positive this detector could produce in the real
+  world, and would you accept it?"** → A person who legitimately travels
+  internationally and logs in shortly after landing could trip the
+  impossible-travel rule if their *previous* login was from home right
+  before departure — the rule can't distinguish "spoofed location" from
+  "someone who just got off a long flight but logged in sooner than the
+  implied-speed threshold allows for commercial travel." I'd accept this
+  as a reasonable false-positive rate for a flagging (not auto-blocking)
+  system — it surfaces a case for a human analyst to dismiss quickly,
+  which is the whole point of a review queue.
+
+### Practice exercise
+
+Add a fourth rule: flag a `password_reset` event that's immediately
+followed (within, say, 5 minutes) by a `login` from a *different* device
+than the one that requested the reset — a classic account-takeover
+pattern. Decide: does it need a new weight in `RULE_WEIGHTS`? Write at
+least one test proving it does NOT fire when the subsequent login uses the
+SAME device (the benign "I reset my password and logged back in" case).
+
+### Verifying the modification
+
+`npx vitest run src/lib/anomaly-detection.test.ts` — fast (well under a
+second), no DB or dev server needed. Then re-run the full canonical-dataset
+cross-validation tests in the same file to make sure your new rule doesn't
+change any existing counts unexpectedly.
+
+---
+
+## Feature: `recompute-stat-scores` job and the admin console's second panel
+
+### What it does and why it exists
+
+The only code path that actually writes `statAnomalyScore`/`statReasons`.
+Mirrors the Day 1 import job's shape exactly on purpose — same admin-only
+gating, same idempotency argument, same progress-reporting pattern — so
+there's only one "how do background jobs work here" mental model to carry,
+not two.
+
+### Files, functions, data structures
+
+- `src/jobs.ts` — `recomputeStatScores(ctx, env)`, dispatched from
+  `runJob` on `job.type === 'recompute-stat-scores'`.
+- `src/pages/(app)/(protected)/admin.tsx` — a second panel, "Statistical
+  anomaly detection," with its own button and its own job list (`JobList`,
+  now a small shared component parameterized by `renderResult` so the
+  import and recompute panels don't duplicate the job-row markup).
+
+### Data flow
+
+```
+Admin clicks "Recompute statistical scores"
+  → enqueue('recompute-stat-scores', {})
+    → AppJobRoom.authorizeWrite (admin-only, same check as the import job)
+      → tools.query('authEvents', { limit: 5000 })        — load everything
+        → computeStatScores(...)                            — pure, in-memory
+          → tools.update(...) per row                        — patch scores back
+            → ctx.progress(...) every 25 rows                — live UI update
+```
+
+### Design decisions & tradeoffs
+
+- **Loads all events into memory in one `tools.query` call** (`limit:
+  5000`), rather than paging. At 1,000-5,000 rows this is simple and fast;
+  it's the first thing that would need to change (paged loading, or moving
+  the computation itself to stream) if the dataset grows an order of
+  magnitude beyond that — flagged, not silently assumed to scale forever.
+- **Always re-patches every row**, even ones whose score wouldn't change.
+  Simpler code, and harmless at this scale; an optimization (skip the
+  `tools.update` call when old and new values are identical) is a cheap,
+  well-scoped follow-up if write volume ever becomes a real cost.
+- **The admin UI's `AnyJobResult` is a union type**, narrowed per job type
+  with a type guard (`isRecomputeResult`), because `useJobs<P, R>` is
+  generic over ONE payload/result pair for the whole room — there are two
+  different job types with two different result shapes sharing one room,
+  so the type has to be a union, not two separate hook calls.
+
+### DeepSpace SDK capabilities used
+
+Same as the import job: `createActionTools` (shared RBAC-bypass helper),
+`ctx.progress`/`ctx.signal` from `JobContext`, `useJobs` on the client.
+
+### Likely bugs & how to diagnose them
+
+- **Symptom: recompute succeeds but the dashboard still shows stale
+  reasons.** `useQuery`'s WebSocket subscription should push the update
+  live — if it doesn't appear, check whether the browser tab's connection
+  dropped (look for a `[RecordRoom] webSocketClose` line in dev server
+  logs) rather than assuming the job itself failed.
+- **Symptom: `job.result.failed > 0` for a handful of rows.** Check
+  `job.result.errors` (capped at 10) — a schema validation failure
+  (`required`/`maxLength`) is the most likely cause, not an RBAC rejection
+  (this path bypasses RBAC entirely via `X-App-Action`).
+
+### Interview questions you might get, and good answers
+
+- **"Why recompute everything instead of only new/changed rows?"** →
+  Simplicity and correctness over micro-optimization at this data scale.
+  Incremental recomputation would need to track "what changed since last
+  run," which adds real state and real bugs (a row that should have been
+  rescored but wasn't, because the tracking logic missed it) to save a
+  cost that doesn't yet exist. I'd revisit this specific tradeoff if the
+  dataset grew by 10-100x.
+
+### Practice exercise
+
+Add a "skip unchanged" optimization: before calling `tools.update`,
+compare the newly computed `statAnomalyScore`/`statReasons` against the
+row's current values (you already have them from the initial `tools.query`)
+and skip the write if they're identical. Report how many writes this saves
+on a full recompute against the Day 1 dataset.
+
+### Verifying the modification
+
+`npm run type-check` first (the admin page's union-typed job results are
+exactly the kind of thing a careless edit breaks silently without it).
+Then, once real data exists (see the Day 2 report), run the job from
+`/admin` and watch the dashboard's summary counts update live.
+
+---
+
+## Feature: The dashboard (`src/pages/(app)/(protected)/dashboard.tsx`)
+
+### What it does and why it exists
+
+The analyst-facing investigation surface: a live table of `authEvents`
+with filters, an alert summary, and a click-through detail view. It is
+intentionally "dumb" — it computes nothing about anomalies itself, it only
+displays what the `recompute-stat-scores` job already wrote.
+
+### Files, functions, data structures
+
+- `useQuery<AuthEventRecord>('authEvents', { limit: 2000, orderBy:
+  'timestamp', orderDir: 'desc' })` — the only data source.
+- Three pieces of local UI state: `eventType`, `flaggedOnly`,
+  `actorSearch`, `sortMode`, `selected` (the row open in the detail modal).
+- `summary` (`useMemo`) — counts over the FULL dataset, independent of
+  filters.
+- `filtered` (`useMemo`) — the subset of rows the current filters/sort
+  actually show.
+
+### Data flow
+
+```
+authEvents (live WebSocket query)
+  → summary: scan ALL rows → { total, flagged, burst, travel, newDevice }
+  → filtered: apply eventType / flaggedOnly / actorSearch → sort by time or score
+  → render: summary cards (always) + filter bar + table (or empty state)
+  → click a row → Modal showing full statReasons
+```
+
+### Design decisions & tradeoffs
+
+- **Filtering happens in React (`useMemo`), not via a DeepSpace `where`
+  query.** `where` is equality-only; there's no "score > 0.5" or "reasons
+  is non-empty" query the SDK supports today. At ≤ a few thousand rows,
+  fetching once and filtering client-side is simpler and fast enough — see
+  `docs/ARCHITECTURE.md` for the scaling boundary this implies.
+- **The alert summary is computed over the full dataset, not the filtered
+  view.** A summary that changes meaning every time you adjust a filter
+  (e.g. "Flagged: 3" meaning something different after you toggle
+  "Flagged only") would be confusing. The summary answers "what's the
+  state of everything"; the table answers "what am I currently looking
+  at." Deliberately two different questions, kept visually separate.
+- **The empty state replaces the whole page**, including the filter bar,
+  when there are zero events. Showing filter controls over a table that
+  can never have rows would be confusing UI with nothing to test. This is
+  also, right now, the actual state of the dev database (see the testing
+  boundary below).
+
+### DeepSpace SDK capabilities used
+
+`useQuery` only — this page makes no mutations and no job calls.
+
+### Likely bugs & how to diagnose them
+
+- **Symptom: a filtered search for an actor shows nothing even though you
+  know events exist.** `actorSearch` matches a case-insensitive substring
+  of `actorId` — check for a typo in the id format (`user_045`, not
+  `User045` or `045`).
+- **Symptom: the "Why" column always shows "—".** Means `statReasons` is
+  either `undefined` (never recomputed) or `[]` (recomputed, found nothing
+  to flag) for that row — the detail modal's body text explicitly
+  distinguishes these two cases for exactly this reason.
+
+### Interview questions you might get, and good answers
+
+- **"This page fetches up to 2000 rows into the browser. What's your
+  plan if this app had 200,000 events?"** → Client-side filtering stops
+  being viable at that scale. I'd move filtering server-side — either a
+  denormalized boolean column (`isFlagged`) DeepSpace's `where` can match
+  on directly, or a dedicated query mechanism if/when one exists — and
+  probably paginate the table instead of rendering everything. I'd treat
+  this as the first thing to revisit, not something to pre-build before
+  there's a real need (see `docs/ARCHITECTURE.md`'s known-risks list).
+
+### Practice exercise
+
+Add a fifth summary stat: "Events in the last 24 hours." You'll need
+`Date.now()` compared against each row's `timestamp` (careful: `timestamp`
+is Unix *seconds*, `Date.now()` is milliseconds — this exact unit mismatch
+is a realistic bug to practice catching).
+
+### Verifying the modification
+
+`npm run type-check`, then (once real data exists) load `/dashboard` and
+confirm the new stat updates when you toggle "Flagged only" — if it
+changes when you expected it to stay fixed (or vice versa), re-read
+"summary vs. filtered" above.
+
+---
+
 ## AI-assisted code: how it was verified
 
 Every piece of SDK usage above was checked against the documented contract

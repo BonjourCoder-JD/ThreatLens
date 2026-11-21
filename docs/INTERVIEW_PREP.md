@@ -81,6 +81,65 @@ is "no, and here's exactly why I stopped rather than guess," which is a
   background job can run for up to 15 minutes per alarm tick (longer with
   `backgroundJobTypes`) and reports live progress.
 
+## Day 2 additions to the rubric mapping
+
+**"Can explain and modify the submitted work."** New practice targets: the
+sliding-window burst detector and the "why is `/dashboard` not admin-gated
+but `authEvents` is still safe" question — both have exact answers in
+`CODE_WALKTHROUGH.md` now.
+
+**"Directs AI tools deliberately and verifies their output."** Concrete
+new example: before writing the dashboard's filtering, I confirmed from the
+SDK's own records reference that `where` is equality-only — there is no
+"score greater than 0.5" query — and designed the filtering client-side
+*because of* that confirmed constraint, not as an assumption. That's the
+difference between "AI wrote a filter" and "verified what the API can and
+can't do, then chose an approach that fits."
+
+**"Thinks aloud and asks useful questions."** Good one to practice: "the
+alert summary counts the full dataset, but the table below it only shows
+filtered rows — why not make them agree?" Answer lives in
+`CODE_WALKTHROUGH.md`'s dashboard section — rehearse saying it without
+reading.
+
+## Day 2 learning session (~20-25 min)
+
+**1. What got built today (5 min).** A pure, three-rule statistical
+detector with no DeepSpace dependency at all (testable with nothing but
+Vitest); a background job that's the *only* thing allowed to write scores,
+following the exact same admin-gated pattern as Day 1's import job; and a
+dashboard that reads and displays what that job wrote, computing nothing
+itself.
+
+**2. The idea worth being able to defend (5 min).** The detector and the
+dashboard are deliberately separated by a hard boundary: all the "is this
+suspicious" logic lives in one pure, synchronously-testable file
+(`anomaly-detection.ts`); the dashboard is pure presentation. If someone
+asks you to change a threshold, you'd touch one file and re-run one fast
+test suite — not hunt through React components for a stray magic number.
+
+**3. The two-pointer sliding window (5 min).** This is the one piece of
+real algorithm in Day 2, and it's exactly the kind of thing worth being
+able to re-derive at a whiteboard. Practice: sort an actor's failed logins
+by time; walk `right` forward one at a time; before checking anything,
+walk `left` forward (never back) until the window fits the time budget;
+the window size is `right - left + 1`. Say it out loud twice.
+
+**4. The honest limitation to lead with, not hide (5 min).** The dashboard
+has only been tested in its empty state — real-data behavior (filters with
+actual flagged rows, the summary counts actually changing) is a known,
+tracked gap until the Day 1 import verification you're doing yourself has
+happened. If asked "is the dashboard fully tested," the accurate answer is
+"the detection logic is thoroughly tested against real data; the dashboard
+UI is tested structurally and in its empty state; testing it against real
+flagged rows is the next step once data exists" — not a flat "yes."
+
+**5. Practice before Day 3 (5 min).** Pick ONE of: (a) the new-device
+"never flag the first event" edge case, or (b) the impossible-travel
+"compare only to the immediately preceding event" choice — and explain out
+loud why removing it would make the detector worse, with a concrete
+example event sequence.
+
 ## Day 1 learning session (~20-25 min)
 
 Read this once, then close the laptop and try to explain it to someone

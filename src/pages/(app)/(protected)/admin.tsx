@@ -11,6 +11,8 @@
 
 import { useJobs, useUser } from 'deepspace'
 import { useQuery } from 'deepspace'
+import type { JobView } from 'deepspace'
+import type { ReactNode } from 'react'
 import { Button, Badge, EmptyState } from '@/components/ui'
 import { SCOPE_ID } from '../../../constants'
 
@@ -22,15 +24,35 @@ interface ImportResult {
   errors: string[]
 }
 
+interface RecomputeResult {
+  totalEvents: number
+  updated: number
+  failed: number
+  flagged: number
+  errors: string[]
+}
+
+type AnyJobResult = ImportResult | RecomputeResult
+
+function isRecomputeResult(r: AnyJobResult): r is RecomputeResult {
+  return 'flagged' in r
+}
+
 export default function AdminPage() {
   const { user } = useUser()
   const isAdmin = user?.role === 'admin'
-  const { jobs, enqueue } = useJobs<{ limit?: number }, ImportResult>(SCOPE_ID)
+  const { jobs, enqueue } = useJobs<Record<string, unknown>, AnyJobResult>(SCOPE_ID)
   const { records: authEvents, status } = useQuery('authEvents', { limit: 2000 })
 
   const importJobs = jobs.filter((j) => j.type === 'import-synthetic-events')
+  const recomputeJobs = jobs.filter((j) => j.type === 'recompute-stat-scores')
   const latestImport = importJobs[0]
+  const latestRecompute = recomputeJobs[0]
   const importRunning = latestImport?.status === 'queued' || latestImport?.status === 'running'
+  const recomputeRunning = latestRecompute?.status === 'queued' || latestRecompute?.status === 'running'
+  const flaggedCount = authEvents.filter(
+    (r) => Array.isArray((r.data as { statReasons?: unknown[] }).statReasons) && (r.data as { statReasons: unknown[] }).statReasons.length > 0,
+  ).length
 
   if (!isAdmin) {
     return (
@@ -54,7 +76,7 @@ export default function AdminPage() {
           for the admin role, not just hidden in this UI.
         </p>
 
-        <section className="rounded-lg border border-border bg-card p-6">
+        <section className="mb-6 rounded-lg border border-border bg-card p-6">
           <h2 className="mb-1 text-lg font-semibold">Synthetic auth log dataset</h2>
           <p className="mb-4 text-sm text-muted-foreground">
             Loads the canonical dataset (<code>scripts/generate-dataset.mjs</code>) into the{' '}
@@ -63,10 +85,7 @@ export default function AdminPage() {
           </p>
 
           <div className="mb-4 flex items-center gap-3">
-            <Button
-              disabled={importRunning}
-              onClick={() => enqueue('import-synthetic-events', {})}
-            >
+            <Button disabled={importRunning} onClick={() => enqueue('import-synthetic-events', {})}>
               {importRunning ? 'Importing…' : 'Import synthetic events'}
             </Button>
             <span className="text-sm text-muted-foreground">
@@ -74,44 +93,89 @@ export default function AdminPage() {
             </span>
           </div>
 
-          {importJobs.length > 0 && (
-            <ul className="space-y-2 text-sm">
-              {importJobs.slice(0, 5).map((job) => (
-                <li
-                  key={job.id}
-                  data-testid="import-job-row"
-                  data-status={job.status}
-                  className="flex items-center justify-between rounded-md border border-border px-3 py-2"
-                >
-                  <div className="flex items-center gap-2">
-                    <Badge
-                      variant={
-                        job.status === 'succeeded'
-                          ? 'success'
-                          : job.status === 'failed'
-                            ? 'destructive'
-                            : 'secondary'
-                      }
-                    >
-                      {job.status}
-                    </Badge>
-                    <span className="text-muted-foreground">
-                      {job.progressMessage ?? (job.progress != null ? `${Math.round(job.progress * 100)}%` : '')}
-                    </span>
-                  </div>
-                  {job.result && (
-                    <span className="text-muted-foreground">
-                      {job.result.imported} imported
-                      {job.result.failed > 0 ? `, ${job.result.failed} failed` : ''}
-                    </span>
-                  )}
-                  {job.error && <span className="text-destructive">{job.error}</span>}
-                </li>
-              ))}
-            </ul>
-          )}
+          <JobList jobs={importJobs} testId="import-job-row" renderResult={renderImportResult} />
+        </section>
+
+        <section className="rounded-lg border border-border bg-card p-6">
+          <h2 className="mb-1 text-lg font-semibold">Statistical anomaly detection</h2>
+          <p className="mb-4 text-sm text-muted-foreground">
+            Recomputes <code>statAnomalyScore</code>/<code>statReasons</code> on every row using
+            the explainable rules in <code>src/lib/anomaly-detection.ts</code> (failed-login
+            bursts, impossible travel, new device). Pure and deterministic — safe to re-run
+            anytime after an import.
+          </p>
+
+          <div className="mb-4 flex items-center gap-3">
+            <Button disabled={recomputeRunning} onClick={() => enqueue('recompute-stat-scores', {})}>
+              {recomputeRunning ? 'Scoring…' : 'Recompute statistical scores'}
+            </Button>
+            <span className="text-sm text-muted-foreground">
+              {status === 'loading' ? 'Loading…' : `${flaggedCount} of ${authEvents.length} currently flagged`}
+            </span>
+          </div>
+
+          <JobList jobs={recomputeJobs} testId="recompute-job-row" renderResult={renderRecomputeResult} />
         </section>
       </div>
     </div>
+  )
+}
+
+function renderImportResult(result: AnyJobResult): ReactNode {
+  if (isRecomputeResult(result)) return null
+  return (
+    <span className="text-muted-foreground">
+      {result.imported} imported
+      {result.failed > 0 ? `, ${result.failed} failed` : ''}
+    </span>
+  )
+}
+
+function renderRecomputeResult(result: AnyJobResult): ReactNode {
+  if (!isRecomputeResult(result)) return null
+  return (
+    <span className="text-muted-foreground">
+      {result.flagged} flagged of {result.totalEvents}
+      {result.failed > 0 ? `, ${result.failed} failed` : ''}
+    </span>
+  )
+}
+
+function JobList({
+  jobs,
+  testId,
+  renderResult,
+}: {
+  jobs: JobView<Record<string, unknown>, AnyJobResult>[]
+  testId: string
+  renderResult: (result: AnyJobResult) => ReactNode
+}) {
+  if (jobs.length === 0) return null
+  return (
+    <ul className="space-y-2 text-sm">
+      {jobs.slice(0, 5).map((job) => (
+        <li
+          key={job.id}
+          data-testid={testId}
+          data-status={job.status}
+          className="flex items-center justify-between rounded-md border border-border px-3 py-2"
+        >
+          <div className="flex items-center gap-2">
+            <Badge
+              variant={
+                job.status === 'succeeded' ? 'success' : job.status === 'failed' ? 'destructive' : 'secondary'
+              }
+            >
+              {job.status}
+            </Badge>
+            <span className="text-muted-foreground">
+              {job.progressMessage ?? (job.progress != null ? `${Math.round(job.progress * 100)}%` : '')}
+            </span>
+          </div>
+          {job.result && renderResult(job.result)}
+          {job.error && <span className="text-destructive">{job.error}</span>}
+        </li>
+      ))}
+    </ul>
   )
 }

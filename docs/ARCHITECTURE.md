@@ -1,6 +1,6 @@
 # ThreatLens — Architecture
 
-Living document. Updated at the end of each build day. Last updated: **Day 1**.
+Living document. Updated at the end of each build day. Last updated: **Day 2**.
 
 ## What this app is
 
@@ -154,6 +154,56 @@ proves the UI half with a real signed-in non-admin session. The DO-level
 rejection itself still needs a direct test once there's an HTTP or WS surface
 worth asserting against — see `docs/CODE_WALKTHROUGH.md` for why that wasn't
 forced into Day 1.
+
+## Day 2: the statistical detection engine and dashboard
+
+The live, explainable detector promised in "Why DeepSpace fits this app" is
+now real. Three pieces:
+
+1. **`src/lib/anomaly-detection.ts`** — pure, dependency-free TypeScript.
+   Three named rules (failed-login burst, impossible travel, new device),
+   each contributing a fixed weight to `statAnomalyScore`, each producing a
+   human-readable string in `statReasons`. No DB, no network, no
+   randomness — same input always produces the same output, which is what
+   makes it unit-testable without a Durable Object and what makes "why was
+   this flagged" answerable by printing `statReasons` back verbatim.
+2. **`src/jobs.ts`'s `recompute-stat-scores` job** — the only thing that
+   writes these fields. Queries every `authEvents` row, calls
+   `computeStatScores`, patches each row's `statAnomalyScore`/`statReasons`.
+   Admin-gated through the same `AppJobRoom.authorizeWrite` as the import
+   job. Recomputing is idempotent by construction (pure function in, pure
+   function out) — there's nothing to duplicate, only existing rows to
+   patch.
+3. **`/dashboard`** — reads `authEvents` live via `useQuery`, filters and
+   sorts client-side (event type, flagged-only, actor search, sort by
+   time/score), shows an alert summary (total/flagged/per-rule counts), and
+   a click-through detail view listing the exact matched reasons for one
+   event. It computes nothing — all it does is render what the job already
+   wrote.
+
+**Why client-side filtering, not `where` queries.** DeepSpace's `where`
+clause is equality-only (per the records reference) — there's no "score >
+0.5" query. At this data scale (≤ a few thousand rows) fetching everything
+once and filtering/sorting in React with `useMemo` is simpler and perfectly
+adequate; a `where`-based filter would need either a derived boolean column
+(e.g. `isFlagged`) or server-side filtering logic that doesn't exist yet.
+Documented as a scaling boundary, not a premature optimization.
+
+**Why `/dashboard` is NOT admin-gated.** Every analyst needs to investigate,
+not just admins — `src/nav.ts` has no `roles` restriction on it, unlike
+`/admin`. The data underneath (`authEvents`) is still closed to anonymous
+visitors at the schema level (`'*': { read: false }`), so this doesn't
+widen who can see the data, only confirms every signed-in `member` can.
+
+**Honest testing boundary.** The dashboard's filter bar and summary cards
+only render once at least one `authEvents` row exists. As of Day 2, this
+dev database is still empty — the admin import happy path is reserved for
+the user to verify personally (see `docs/DEBUGGING_LOG.md` /
+the Day 2 report), so the dashboard's richer behavior (real flagged rows,
+non-empty filters) hasn't been exercised against real data yet either. What
+*is* tested, thoroughly, is the detection engine itself — directly against
+the real canonical dataset, including cross-validation against its
+ground-truth labels (see `docs/CODE_WALKTHROUGH.md`).
 
 ## Known risks / limitations (living list)
 

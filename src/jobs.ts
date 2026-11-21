@@ -22,6 +22,7 @@
 
 import type { Job, JobContext } from 'deepspace/worker'
 import { createActionTools } from './server/record-tools.js'
+import { computeStatScores, type AuthEventInput } from './lib/anomaly-detection.js'
 import type { Env } from '../worker.js'
 import syntheticDataset from './data/synthetic-auth-events.json'
 
@@ -91,10 +92,81 @@ async function importSyntheticEvents(
   }
 }
 
+/**
+ * Recomputes every authEvents row's `statAnomalyScore`/`statReasons` from
+ * scratch using the pure, deterministic rules in
+ * src/lib/anomaly-detection.ts. Runs as a background job (not a server
+ * action) for the same reason the import does: querying and patching
+ * hundreds-to-thousands of rows can exceed a single HTTP response.
+ *
+ * Idempotent by construction — `computeStatScores` is a pure function, so
+ * recomputing against unchanged data always reproduces the same scores.
+ * There's nothing to "duplicate": this only patches existing rows, it
+ * never creates any.
+ */
+async function recomputeStatScores(ctx: JobContext, env: Env): Promise<unknown> {
+  const tools = createActionTools(env, env.OWNER_USER_ID, '')
+
+  const queryResult = await tools.query<{
+    actorId: string
+    timestamp: number
+    country: string
+    city: string
+    device: string
+    eventType: string
+    success: number
+    statReasons?: string[]
+  }>('authEvents', { limit: 5000 })
+  if (!queryResult.success) {
+    throw new Error(`Failed to load authEvents: ${queryResult.error}`)
+  }
+
+  const inputs: AuthEventInput[] = queryResult.data.records.map((r) => ({
+    recordId: r.recordId,
+    actorId: r.data.actorId,
+    timestamp: r.data.timestamp,
+    country: r.data.country,
+    city: r.data.city,
+    device: r.data.device,
+    eventType: r.data.eventType,
+    success: r.data.success,
+  }))
+
+  const results = computeStatScores(inputs)
+  const total = results.length
+  let updated = 0
+  let failed = 0
+  const errors: string[] = []
+
+  for (let i = 0; i < total; i++) {
+    if (ctx.signal.aborted) break
+    const r = results[i]
+    const outcome = await tools.update('authEvents', r.recordId, {
+      statAnomalyScore: r.statAnomalyScore,
+      statReasons: r.statReasons,
+    })
+    if (outcome.success) updated += 1
+    else {
+      failed += 1
+      if (errors.length < 10) errors.push(`${r.recordId}: ${outcome.error}`)
+    }
+
+    if (i % 25 === 0 || i === total - 1) {
+      ctx.progress((i + 1) / total, `${i + 1}/${total} events scored`)
+    }
+  }
+
+  const flagged = results.filter((r) => r.statReasons.length > 0).length
+  return { totalEvents: total, updated, failed, flagged, errors }
+}
+
 export async function runJob(job: Job, ctx: JobContext, env: Env): Promise<unknown> {
   switch (job.type) {
     case 'import-synthetic-events': {
       return importSyntheticEvents(ctx, env, (job.payload as ImportSyntheticEventsPayload) ?? {})
+    }
+    case 'recompute-stat-scores': {
+      return recomputeStatScores(ctx, env)
     }
     default:
       throw new Error(`Unknown job type: ${job.type}`)

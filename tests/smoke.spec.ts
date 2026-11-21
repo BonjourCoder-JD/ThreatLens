@@ -72,6 +72,30 @@ test.describe('Smoke tests', () => {
 })
 
 /**
+ * Dashboard — visible to every signed-in analyst (unlike /admin, this is
+ * NOT role-gated; src/nav.ts has no `roles` on it). Only the empty-state
+ * path is testable against this dev database right now: it is genuinely
+ * empty until the admin import happy path has been run (see
+ * docs/DEBUGGING_LOG.md / the Day 2 report — that verification is reserved
+ * for the user, not simulated here). The filter bar and summary cards only
+ * render once there's at least one event, so testing them is a follow-up
+ * once real data exists — tracked, not silently skipped.
+ */
+test.describe('Dashboard', () => {
+  dsTest('non-admin analyst can reach the dashboard and sees the nav link', async ({ users }) => {
+    const [analyst] = await users(1)
+    await analyst.page.goto('/home')
+    await dsExpect(analyst.page.getByRole('link', { name: 'Dashboard' })).toBeVisible({ timeout: 15_000 })
+  })
+
+  dsTest('dashboard shows an empty state when no events are imported yet', async ({ users }) => {
+    const [analyst] = await users(1)
+    await analyst.page.goto('/dashboard')
+    await dsExpect(analyst.page.getByText(/No events yet|Loading events/)).toBeVisible({ timeout: 15_000 })
+  })
+})
+
+/**
  * Admin page gating — a signed-in, non-admin analyst must never see the
  * data-management controls. This is the UI half of the requirement that
  * admin-only operations are enforced server-side (worker.ts's
