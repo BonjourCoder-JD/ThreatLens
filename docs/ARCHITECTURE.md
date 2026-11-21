@@ -1,0 +1,172 @@
+# ThreatLens — Architecture
+
+Living document. Updated at the end of each build day. Last updated: **Day 1**.
+
+## What this app is
+
+ThreatLens is a collaborative tool for analysts to investigate synthetic
+authentication logs. It has two anomaly-detection layers on purpose:
+
+1. **Live, explainable statistics** (Day 2) — rule-based scoring (burst
+   detection, impossible travel, new device) computed in TypeScript, inside
+   the app, on every event. An analyst can always see *why* something was
+   flagged.
+2. **Offline Isolation Forest ML** (Day 3) — a `scikit-learn` model trained
+   **outside** the app, once, against an exported copy of the same dataset.
+   Its scores are imported as a one-time enrichment, never computed live.
+
+That split isn't a workaround — it's the honest answer to "where does ML run
+on Cloudflare Workers?" It doesn't; Workers can't run Python/scikit-learn.
+Point this out proactively in the interview; it reads as architectural
+judgment, not a gap.
+
+## Why DeepSpace fits this app
+
+Everything below is implemented with **documented** DeepSpace SDK surfaces
+only — no invented APIs, no second backend:
+
+| Need                              | DeepSpace mechanism                                   |
+| --------------------------------- | ------------------------------------------------------ |
+| Auth, roles                       | `DeepSpaceAuthProvider`, `<AuthGate>`, `useAuth`        |
+| Persistent, schema'd data         | `RecordRoom` collections (`src/schemas/`)               |
+| RBAC on that data                 | Per-collection `permissions` block (server-enforced)    |
+| Real-time sync across analysts    | `useQuery`/`useMutations` WebSocket fan-out             |
+| Bulk, long-running data ops       | `JobRoom` background jobs (`src/jobs.ts`)                |
+| Orchestration bypassing user RBAC | Server actions (`src/actions/`, Day 3)                   |
+| "Who's looking at this case"      | `usePresence` (Day 3/4, deliberately last)               |
+
+## Data model
+
+Four collections, all defined in `src/schemas/` and registered in
+`src/schemas.ts`:
+
+- **`users`** — scaffold-required, untouched.
+- **`authEvents`** — one row per synthetic log entry. System-written only
+  (client `create`/`update` are `false` for every role); analysts have
+  read-only access. See "Synthetic data pipeline" below for how rows get in.
+- **`cases`** (Day 3) — an investigation opened against one or more flagged
+  events. Every analyst can read and edit every case — this is a small team
+  working one shared queue, not a multi-tenant product, so there's no
+  per-case collaborator list.
+- **`caseNotes`** (Day 3) — the comment timeline on a case.
+
+Full column lists and the RBAC rationale for each are in
+`docs/CODE_WALKTHROUGH.md` under "Collection schemas."
+
+## Auth model: deliberately still "Mixed," not "Fully gated"
+
+The scaffold ships three documented auth models (Mixed / Fully gated /
+Fully public). I kept **Mixed** rather than switching to Fully gated. This
+was a conscious tradeoff, not an oversight — be ready to explain it:
+
+- The sensitive collections (`authEvents`, `cases`, `caseNotes`) already deny
+  `'*'` (anonymous) and `viewer` at the **schema permissions** level. An
+  anonymous visitor hitting `/admin` or any gated page gets nothing from the
+  record room regardless of what the page renders — the RBAC check happens
+  in the Durable Object, before data reaches the WebSocket.
+- Gated pages (`/admin`, `/settings`, future `/cases`) still sit under the
+  existing `src/pages/(app)/(protected)/` group, which already wraps them in
+  `<AuthGate>`.
+- Switching the *whole app* to Fully gated would also require hardening
+  `wsRoute` in `src/server/realtime-routes.ts` to reject tokenless
+  connections — a real security-relevant edit — for no additional protection
+  on the collections that actually matter, since they're already closed to
+  anonymous/viewer roles.
+
+Net effect: public landing page stays public (and the existing smoke tests
+that assert that keep passing), investigation data stays genuinely private,
+and one less structural change was made than necessary. If asked "why not
+fully gate it," this is the answer — not "I didn't think of it."
+
+## Synthetic data pipeline (Day 1)
+
+One canonical generator, not two. This directly satisfies the approved
+requirement to avoid maintaining parallel TypeScript/Python generators:
+
+```
+scripts/generate-dataset.mjs  (run once, by hand, offline)
+        │
+        ▼
+src/data/synthetic-auth-events.json   ← committed to the repo
+        │                                    │
+        ▼                                    ▼
+src/jobs.ts: import-synthetic-events    Day 3: isolation_forest.py reads
+  (background job, admin-only,            the SAME file for features/
+   upserts into `authEvents`)             training — no second generator
+```
+
+Key properties, and why each one exists:
+
+- **Deterministic.** A seeded PRNG (`mulberry32`) means `(count, seed)`
+  always produces byte-identical output. This is what makes growing the
+  dataset later ("start with 1,000, scale up without redesign") safe: bump
+  `count`, keep the seed, rerun — events `0..999` are untouched, only new
+  ones are appended.
+- **Idempotent import.** The dataset's `eventId` (e.g. `evt_000042`) is
+  passed as the DeepSpace `recordId` when importing. The SDK's
+  `tools.create(collection, data, recordId)` upserts (merges) when that id
+  already exists instead of inserting a duplicate — so re-running the import
+  job, including after a redeploy, never duplicates a row or leaves
+  inconsistent scores. This is the SDK's own documented mechanism, not
+  something built on top of it.
+- **ML-ready.** Every field the Day-3 Isolation Forest will engineer
+  features from (`timestamp`, `actorId`, `country`/`city`, `device`,
+  `eventType`, `success`) is already in the one JSON file, plus a
+  `groundTruthAnomaly`/`groundTruthReason` pair injected by the generator for
+  the eventual precision/recall evaluation — see "Ground truth" below.
+
+## Ground truth and the evaluation report (Day 3/4, scaffolded now)
+
+The generator injects three known anomaly patterns (`impossible_travel`,
+`brute_force_burst`, `new_device_odd_hour`) at a **realistic ~4-5% rate** —
+not 10%, and very much not the 29% an early version of the generator
+accidentally produced (see `docs/DEBUGGING_LOG.md`). Each injected event
+carries `groundTruthAnomaly: 1` and a reason string.
+
+This label exists **only** to let the Day-3/4 evaluation report compute real
+precision/recall for both detectors against a known answer. It is a property
+of the synthetic dataset, not a verdict on a real event, and the plan is to
+never show it to analysts as if it were one — the main dashboard will not
+render "ground truth: true." Reporting it as if it were an independent,
+trustworthy label would be the "misleading metrics" the brief explicitly
+asked to avoid, since the detectors and the label come from the same
+author's assumptions about what an anomaly looks like.
+
+## Admin-only enforcement (server-side, not UI-only)
+
+Every current job type (`import-synthetic-events`, and the Day 2/3
+`recompute-stat-scores` / `import-ml-scores`) is an administrative operation.
+`worker.ts`'s `AppJobRoom` sets:
+
+```ts
+authorizeWrite: async (user) => {
+  if (user.userId.startsWith('anon-')) return false
+  const role = await resolveAppRole(env, user.userId)
+  return role === 'admin'
+}
+```
+
+This runs **in the Durable Object**, re-checked on every `enqueue` /
+`cancel` / `retry` — not just once at connect. `src/pages/.../admin.tsx`
+also hides the button from non-admins, but that's UX; the real boundary is
+this callback. `tests/smoke.spec.ts` ("non-admin analyst sees 'Admins only'")
+proves the UI half with a real signed-in non-admin session. The DO-level
+rejection itself still needs a direct test once there's an HTTP or WS surface
+worth asserting against — see `docs/CODE_WALKTHROUGH.md` for why that wasn't
+forced into Day 1.
+
+## Known risks / limitations (living list)
+
+- **Worker bundle size.** The committed dataset JSON is bundled into the
+  Worker. At 1,000 events it's ~370KB raw (~480KB gzip for the whole worker
+  bundle). Growing the dataset 10-50x should be re-checked against Cloudflare
+  Workers' bundle size limits before assuming "just bump count" scales
+  indefinitely.
+- **Sequential bulk writes.** The import job writes one record at a time
+  (no bulk-insert API is exposed by the SDK). Fine at 1,000 rows; at much
+  larger counts this would need chunked/parallel writes or a different
+  strategy — a known, documented tradeoff, not an oversight.
+- **Vitest unit-test runner is currently broken in this environment**
+  (unrelated to this app's code — see `docs/DEBUGGING_LOG.md`). The
+  project's primary, documented test contract (`npx deepspace test run`,
+  Playwright-based) is unaffected and passing.
