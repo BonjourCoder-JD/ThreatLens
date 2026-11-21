@@ -1086,6 +1086,156 @@ exercises the full create → status → note lifecycle already.
 
 ---
 
+## Feature: Offline Isolation Forest ML integration
+
+### What it does and why it exists
+
+The second, independent anomaly-detection layer the project's design has
+promised since Day 1: an unsupervised scikit-learn model, trained and
+scored once outside the app, whose output (a score + outlier flag per
+event) is imported as a static enrichment. It exists specifically to be
+**different** from the statistical detector — not a reimplementation of
+the same three rules, but a model that finds its own structure in
+engineered features without being told what "anomalous" means in advance.
+
+### Files, functions, data structures
+
+- `scripts/ml/features.py` — `engineer_features(events)`, pure, no model,
+  no I/O, no ground truth. `FEATURE_NAMES` is the canonical column order.
+- `scripts/ml/train_and_evaluate.py` — `transform_features`,
+  `fit_and_score` (both unit-tested directly), `main()` (the full
+  pipeline), `build_report()` (generates `docs/ML_EVALUATION_REPORT.md`
+  from this run's real numbers).
+- `scripts/ml/test_features.py`, `test_scoring.py` — 14 pytest tests.
+- `src/jobs.ts` — `importMlScores`, dispatched on `job.type ===
+  'import-ml-scores'`.
+- `src/pages/.../admin.tsx` — third panel, same `JobList` component the
+  other two jobs already use.
+- `src/pages/.../dashboard.tsx` — ML score column, "ML outliers only"
+  filter, side-by-side scores in the detail modal with an explicit
+  explanation of what each score is.
+
+### Data flow
+
+See `docs/ARCHITECTURE.md`'s Phase 3 section for the full pipeline
+diagram. The short version: Python reads the same dataset JSON the TS
+import job reads, engineers features, trains, scores, evaluates against
+ground truth (only at the very end), and writes two committed files; the
+TS job then does nothing but a keyed `update` loop over one of those
+files.
+
+### Design decisions & tradeoffs
+
+- **`tools.update`, not `tools.create`, for the import.** This isn't a
+  style choice — `update` is documented to refuse to create a row that
+  doesn't exist ("updates never create"), which means the import
+  literally cannot produce a duplicate, a stronger guarantee than
+  "we're careful about it." The tradeoff: if `authEvents` doesn't already
+  have a row for some `eventId` (e.g. the synthetic import hasn't run
+  yet), that row's ML score silently fails to apply — counted in
+  `job.result.failed`, not thrown, same pattern as the other jobs.
+- **One Python process, two outputs, both committed.** `ml-scores.json`
+  (what the app imports) and `ML_EVALUATION_REPORT.md` (what a human or
+  interviewer reads) come from the exact same run, so the report's claimed
+  numbers and the actually-imported scores can never quietly diverge —
+  there's no second manual step where someone could hand-edit the report.
+- **Ground truth is read in exactly one place, at the very end.** Not a
+  style preference — it's what makes "no data leakage" checkable by a
+  test rather than just asserted in a comment (see
+  `test_engineer_features_never_reads_ground_truth`).
+- **`contamination=0.05` is informed by the known injection rate.**
+  Disclosed as a limitation in the report rather than hidden — a cleaner
+  number would have been to leave it at sklearn's default and report worse
+  metrics, but that would have been less informative about what the
+  features and model CAN do, so the tradeoff was made consciously and
+  written down.
+- **The admin-triggered import itself was handed off, not clicked by the
+  agent.** Same reasoning as Day 1's synthetic-event import: test accounts
+  can never be admin, and driving the real owner's OAuth session isn't
+  something to automate. What's verified directly: the Python pipeline
+  (real run, real tests), the job's logic (type-checked, reviewed against
+  the SDK's documented guarantees), and that a non-admin's attempt is
+  refused at the wire-protocol level.
+
+### DeepSpace SDK capabilities used
+
+Identical job/action infrastructure to the earlier jobs — no new SDK
+surface was needed for this feature. The interesting part of this phase
+is almost entirely in `scripts/ml/`, which (deliberately) uses no
+DeepSpace imports at all.
+
+### Likely bugs & how to diagnose them
+
+- **A real one, already hit:** `Path.write_text(report)` with no
+  explicit encoding corrupted every em-dash in the generated report on
+  Windows (default text encoding isn't UTF-8). See
+  `docs/DEBUGGING_LOG.md`. The general lesson: any Python file write that
+  will be committed to a cross-platform repo needs `encoding="utf-8"`
+  explicitly — never rely on a platform default.
+- **Symptom: a dashboard row shows "Not yet scored" for ML but has a
+  statistical score.** Expected and correct until `import-ml-scores` has
+  been run at least once — the two jobs are completely independent, and
+  running one doesn't imply the other has run.
+- **Symptom: re-running `train_and_evaluate.py` changes the scores.**
+  Shouldn't happen with `random_state=42` fixed — if it does, check
+  whether the dataset file itself changed (a different `datasetVersion`
+  means different input, which legitimately changes output) before
+  suspecting the model.
+
+### Interview questions you might get, and good answers
+
+- **"Explain how Isolation Forest decides a point is anomalous."** → It
+  builds many trees that split the feature space on random features at
+  random thresholds. A typical point takes many splits to end up alone in
+  its own leaf; an unusual point — one that's extreme on some feature —
+  gets isolated in far fewer splits, because a random cut is more likely
+  to separate an extreme value quickly. Average path-to-isolation length
+  across all trees, inverted, is the anomaly score. No labels involved
+  anywhere in that process.
+- **"Why not just feed the model the same three signals the statistical
+  detector checks, with the same thresholds?"** → That would make it a
+  slower, less-explainable copy of the existing rules, not a second
+  independent signal. The features here (distance, speed, device novelty,
+  failed-count, time-of-day) are continuous and the model finds its own
+  combinations and thresholds in them — which is exactly why it disagrees
+  with the rule engine sometimes (see the per-pattern breakdown in the
+  evaluation report, especially how poorly it does on `new_device_odd_hour`
+  compared to the rule engine, which catches it by definition).
+- **"How do you know there's no leakage?"** → Point to the actual test,
+  not just the design: `test_engineer_features_never_reads_ground_truth`
+  passes events with the ground-truth keys entirely absent and asserts
+  feature engineering still succeeds — the function physically cannot
+  depend on data that isn't there.
+- **"Precision 0.56 — is that good?"** → For catching two of three
+  pattern types perfectly and being informed by the true contamination
+  rate, it's about what I'd expect, not something to oversell. The honest
+  framing is in the report's limitations: this measures agreement with
+  three known synthetic patterns in a small dataset, not real-world
+  accuracy, and I'd say that plainly before quoting the number.
+
+### Practice exercise
+
+Add a 9th feature: `is_first_event_for_actor` (0/1) — directly encodes
+what currently has to be inferred from `minutes_since_prev_event` hitting
+its sentinel value. Retrain, re-evaluate, and check whether precision/
+recall actually changed. (It might not move much — that's a legitimate,
+useful finding too: it tells you the sentinel was already doing that job
+adequately.) Write one test asserting the new feature is 1.0 for exactly
+one row per actor.
+
+### Verifying the modification
+
+```
+source .venv-ml/Scripts/activate   (Windows) — see scripts/ml/requirements.txt
+python scripts/ml/train_and_evaluate.py
+pytest scripts/ml
+```
+
+Then re-check `docs/ML_EVALUATION_REPORT.md`'s numbers actually changed
+(or didn't, and you understand why).
+
+---
+
 ## AI-assisted code: how it was verified
 
 Every piece of SDK usage above was checked against the documented contract

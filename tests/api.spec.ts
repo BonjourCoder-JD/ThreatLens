@@ -44,59 +44,78 @@ function jobRoomId(): string {
  * worker.ts's `AppJobRoom.authorizeWrite` for the server-side check this
  * proves, and docs/ARCHITECTURE.md ("Admin-only enforcement").
  */
+/**
+ * Shared helper: signs in a non-admin, opens a raw WebSocket to the jobs
+ * room, attempts to enqueue the given job type, and returns every message
+ * received. Used to prove server-side rejection for EVERY admin-only job
+ * type, not just the first one — same wire message
+ * (`MSG.JOB_ENQUEUE` = `'job.enqueue'`) regardless of which job type is
+ * named in the payload.
+ */
+async function attemptJobEnqueue(
+  page: import('@playwright/test').Page,
+  jobType: string,
+): Promise<Array<{ type: string; payload?: { kind?: string; error?: string } }>> {
+  await page.goto('/home')
+  const tokenRes = await page.request.post('/api/auth/token')
+  const { token } = (await tokenRes.json()) as { token?: string }
+
+  return page.evaluate(
+    async ({ token, roomId, jobType }) => {
+      return await new Promise<unknown[]>((resolve) => {
+        const seen: unknown[] = []
+        const wsUrl = `${location.origin.replace(/^http/, 'ws')}/ws/jobs/${roomId}?token=${token}`
+        const ws = new WebSocket(wsUrl)
+        const finish = () => {
+          ws.close()
+          resolve(seen)
+        }
+        ws.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data as string) as { type: string; payload?: { kind?: string } }
+          seen.push(msg)
+          if (msg.type === 'core.error') finish()
+          if (msg.type === 'job.update' && msg.payload?.kind === 'enqueued') finish()
+        }
+        ws.onopen = () => {
+          ws.send(
+            JSON.stringify({
+              type: 'job.enqueue',
+              payload: { requestId: 'direct-api-test-1', type: jobType, payload: {} },
+            }),
+          )
+        }
+        ws.onerror = () => finish()
+        setTimeout(finish, 8000)
+      })
+    },
+    { token, roomId: jobRoomId(), jobType },
+  ) as Promise<Array<{ type: string; payload?: { kind?: string; error?: string } }>>
+}
+
 dsTest.describe('Job room direct-API authorization', () => {
   dsTest(
     'non-admin enqueue of import-synthetic-events is refused over the raw WebSocket',
     async ({ users }) => {
       const [analyst] = await users(1)
-      await analyst.page.goto('/home')
+      const messages = await attemptJobEnqueue(analyst.page, 'import-synthetic-events')
 
-      const tokenRes = await analyst.page.request.post('/api/auth/token')
-      dsExpect(tokenRes.ok()).toBeTruthy()
-      const { token } = (await tokenRes.json()) as { token?: string }
-      dsExpect(token).toBeTruthy()
+      const enqueued = messages.find((m) => m.type === 'job.update' && m.payload?.kind === 'enqueued')
+      const rejected = messages.find((m) => m.type === 'core.error')
 
-      const messages = await analyst.page.evaluate(
-        async ({ token, roomId }) => {
-          return await new Promise<unknown[]>((resolve) => {
-            const seen: unknown[] = []
-            const wsUrl = `${location.origin.replace(/^http/, 'ws')}/ws/jobs/${roomId}?token=${token}`
-            const ws = new WebSocket(wsUrl)
-            const finish = () => {
-              ws.close()
-              resolve(seen)
-            }
-            ws.onmessage = (ev) => {
-              const msg = JSON.parse(ev.data as string) as { type: string; payload?: { kind?: string } }
-              seen.push(msg)
-              if (msg.type === 'core.error') finish()
-              if (msg.type === 'job.update' && msg.payload?.kind === 'enqueued') finish()
-            }
-            ws.onopen = () => {
-              ws.send(
-                JSON.stringify({
-                  type: 'job.enqueue',
-                  payload: {
-                    requestId: 'direct-api-test-1',
-                    type: 'import-synthetic-events',
-                    payload: {},
-                  },
-                }),
-              )
-            }
-            ws.onerror = () => finish()
-            setTimeout(finish, 8000)
-          })
-        },
-        { token, roomId: jobRoomId() },
-      )
+      dsExpect(enqueued).toBeUndefined()
+      dsExpect(rejected).toBeTruthy()
+      dsExpect(rejected?.payload?.error).toContain('Write access denied')
+    },
+  )
 
-      const enqueued = (messages as Array<{ type: string; payload?: { kind?: string } }>).find(
-        (m) => m.type === 'job.update' && m.payload?.kind === 'enqueued',
-      )
-      const rejected = (messages as Array<{ type: string; payload?: { error?: string } }>).find(
-        (m) => m.type === 'core.error',
-      )
+  dsTest(
+    'non-admin enqueue of import-ml-scores is refused over the raw WebSocket',
+    async ({ users }) => {
+      const [analyst] = await users(1)
+      const messages = await attemptJobEnqueue(analyst.page, 'import-ml-scores')
+
+      const enqueued = messages.find((m) => m.type === 'job.update' && m.payload?.kind === 'enqueued')
+      const rejected = messages.find((m) => m.type === 'core.error')
 
       dsExpect(enqueued).toBeUndefined()
       dsExpect(rejected).toBeTruthy()

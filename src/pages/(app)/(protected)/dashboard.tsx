@@ -74,6 +74,7 @@ export default function DashboardPage() {
 
   const [eventType, setEventType] = useState<EventTypeFilter>('all')
   const [flaggedOnly, setFlaggedOnly] = useState(false)
+  const [mlOutlierOnly, setMlOutlierOnly] = useState(false)
   const [actorSearch, setActorSearch] = useState('')
   const [sortMode, setSortMode] = useState<SortMode>('time')
   const [selected, setSelected] = useState<(typeof records)[number] | null>(null)
@@ -97,14 +98,18 @@ export default function DashboardPage() {
     let burst = 0
     let travel = 0
     let newDevice = 0
+    let mlOutliers = 0
+    let mlScored = 0
     for (const r of records) {
       const reasons = r.data.statReasons ?? []
       if (reasons.length > 0) flagged += 1
       if (reasons.some((x) => x.startsWith('Failed-login burst'))) burst += 1
       if (reasons.some((x) => x.startsWith('Impossible travel'))) travel += 1
       if (reasons.some((x) => x.startsWith('New device'))) newDevice += 1
+      if (r.data.mlAnomalyScore != null) mlScored += 1
+      if (r.data.mlIsOutlier === 1) mlOutliers += 1
     }
-    return { total: records.length, flagged, burst, travel, newDevice }
+    return { total: records.length, flagged, burst, travel, newDevice, mlOutliers, mlScored }
   }, [records])
 
   // --- Charts: both computed from the SAME `records` the table renders —
@@ -139,6 +144,7 @@ export default function DashboardPage() {
     let rows = records
     if (eventType !== 'all') rows = rows.filter((r) => r.data.eventType === eventType)
     if (flaggedOnly) rows = rows.filter((r) => (r.data.statReasons?.length ?? 0) > 0)
+    if (mlOutlierOnly) rows = rows.filter((r) => r.data.mlIsOutlier === 1)
     if (actorSearch.trim()) {
       const needle = actorSearch.trim().toLowerCase()
       rows = rows.filter((r) => r.data.actorId.toLowerCase().includes(needle))
@@ -150,7 +156,7 @@ export default function DashboardPage() {
       sorted.sort((a, b) => b.data.timestamp - a.data.timestamp)
     }
     return sorted
-  }, [records, eventType, flaggedOnly, actorSearch, sortMode])
+  }, [records, eventType, flaggedOnly, mlOutlierOnly, actorSearch, sortMode])
 
   if (status === 'loading') {
     return <div className="flex h-64 items-center justify-center text-muted-foreground">Loading events…</div>
@@ -178,12 +184,13 @@ export default function DashboardPage() {
           explainable statistical detector — click any row for the full explanation.
         </p>
 
-        <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-5" data-testid="alert-summary">
+        <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-6" data-testid="alert-summary">
           <StatCard label="Total events" value={summary.total} />
-          <StatCard label="Flagged" value={summary.flagged} tone="alert" />
+          <StatCard label="Flagged (statistical)" value={summary.flagged} tone="alert" />
           <StatCard label="Failed-login bursts" value={summary.burst} tone="alert" />
           <StatCard label="Impossible travel" value={summary.travel} tone="alert" />
           <StatCard label="New device" value={summary.newDevice} tone="alert" />
+          <StatCard label="ML outliers" value={summary.mlOutliers} tone="alert" />
         </div>
 
         <div className="mb-6 grid gap-4 lg:grid-cols-2">
@@ -258,6 +265,18 @@ export default function DashboardPage() {
               Flagged only
             </Label>
           </div>
+
+          <div className="flex items-center gap-2 pb-2">
+            <Switch
+              id="ml-outlier-only"
+              checked={mlOutlierOnly}
+              onCheckedChange={setMlOutlierOnly}
+              data-testid="filter-ml-outlier-only"
+            />
+            <Label htmlFor="ml-outlier-only" className="text-sm">
+              ML outliers only
+            </Label>
+          </div>
         </div>
 
         <div className="mb-2 flex items-center justify-between">
@@ -288,7 +307,8 @@ export default function DashboardPage() {
                   <th className="px-3 py-2">Type</th>
                   <th className="px-3 py-2">Location</th>
                   <th className="px-3 py-2">Device</th>
-                  <th className="px-3 py-2">Score</th>
+                  <th className="px-3 py-2">Stat. score</th>
+                  <th className="px-3 py-2">ML score</th>
                   <th className="px-3 py-2">Why</th>
                 </tr>
               </thead>
@@ -329,6 +349,19 @@ export default function DashboardPage() {
                         <Badge variant={scoreBadgeVariant(score)} size="sm">
                           {score.toFixed(2)}
                         </Badge>
+                      </td>
+                      <td className="px-3 py-2">
+                        {r.data.mlAnomalyScore == null ? (
+                          <span className="text-muted-foreground">—</span>
+                        ) : (
+                          <Badge
+                            variant={r.data.mlIsOutlier === 1 ? 'destructive' : 'secondary'}
+                            size="sm"
+                            data-testid="ml-score-badge"
+                          >
+                            {r.data.mlAnomalyScore.toFixed(2)}
+                          </Badge>
+                        )}
                       </td>
                       <td className="px-3 py-2 text-muted-foreground">
                         {reasons.length === 0 ? '—' : `${reasons.length} reason${reasons.length === 1 ? '' : 's'}`}
@@ -388,11 +421,34 @@ export default function DashboardPage() {
                   </Badge>
                 </dd>
               </div>
+              <div>
+                <dt className="text-muted-foreground">ML score (offline model)</dt>
+                <dd>
+                  {selected.data.mlAnomalyScore == null ? (
+                    <span className="text-sm text-muted-foreground">Not yet scored</span>
+                  ) : (
+                    <Badge variant={selected.data.mlIsOutlier === 1 ? 'destructive' : 'secondary'} size="sm">
+                      {selected.data.mlAnomalyScore.toFixed(2)}
+                      {selected.data.mlIsOutlier === 1 ? ' · outlier' : ''}
+                    </Badge>
+                  )}
+                </dd>
+              </div>
             </dl>
 
             <div className="mt-5">
-              <h3 className="mb-2 text-sm font-semibold">Why this was flagged</h3>
+              <h3 className="mb-2 text-sm font-semibold">Why this was flagged (statistical)</h3>
               <EventReasons reasons={selected.data.statReasons ?? []} />
+            </div>
+
+            <div className="mt-5 rounded-md border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
+              <strong className="text-foreground">Statistical score</strong> is computed live, inside the
+              app, from three named rules you can see above — every flag traces back to an explicit
+              threshold. <strong className="text-foreground">ML score</strong> comes from an offline
+              Isolation Forest model (scikit-learn), trained once outside the app and imported as a static
+              enrichment — it has no rule to point to, only a learned sense of "how unusual is this event's
+              combination of features." They can, and sometimes do, disagree; see{' '}
+              <code>docs/ML_EVALUATION_REPORT.md</code> for how well they agree on this dataset.
             </div>
 
             <RuleReference />

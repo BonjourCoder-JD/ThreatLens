@@ -1,0 +1,17 @@
+# Offline ML tooling only — never installed in, or required by, the
+# deployed Cloudflare Worker. Cloudflare Workers cannot run Python; this
+# venv exists purely to run scripts/ml/train_and_evaluate.py by hand and
+# commit its output (src/data/ml-scores.json, docs/ML_EVALUATION_REPORT.md)
+# to the repo. See docs/ARCHITECTURE.md ("Why offline inference").
+#
+# Setup:
+#   python3 -m venv .venv-ml
+#   source .venv-ml/Scripts/activate   (Windows) / source .venv-ml/bin/activate (macOS/Linux)
+#   pip install -r scripts/ml/requirements.txt
+#   pip install pytest
+#   python scripts/ml/train_and_evaluate.py
+#   pytest scripts/ml
+
+numpy==2.5.5
+pandas==3.1.1
+scikit-learn==1.9.1

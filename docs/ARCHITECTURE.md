@@ -1,6 +1,6 @@
 # ThreatLens — Architecture
 
-Living document. Updated at the end of each build day. Last updated: **P0 roadmap Phase 2 (case investigation workflow)**.
+Living document. Updated at the end of each build day. Last updated: **P0 roadmap Phase 3 (offline ML integration)**.
 
 ## Submission roadmap (tracked — updated after every phase)
 
@@ -12,10 +12,10 @@ independent and substantial; #4 needs final screenshots, so it's last.
 | # | Item | Status |
 |---|---|---|
 | 1 | Better statistical explanations | **Done.** Thresholds embedded in every reason string plus a durable "Detection rule reference" panel; explanation-correctness tests added. |
-| 3 | Case investigation workflow | **Done.** Create-from-event(s), status/priority/assignment, chronological notes, real-time sync — verified with two real signed-in analysts, not mocked. Full detail below. |
-| 5 | Royal-blue UI | **Done.** Dashboard, admin, and the new case list/detail screens all share the same theme tokens and components; responsive and accessible (verified Day 2). |
-| 2 | ML evaluation (precision/recall) | **Not started.** Next up. |
-| 4 | README + architecture diagram | **Not started.** Deliberately last — needs the finished UI for screenshots. |
+| 3 | Case investigation workflow | **Done.** Create-from-event(s), status/priority/assignment, chronological notes, real-time sync — verified with two real signed-in analysts, not mocked. |
+| 5 | Royal-blue UI | **Done.** Dashboard, admin, and case screens share the same theme tokens and components; responsive and accessible. ML scores display alongside statistical scores with a clear explanation of what each represents. |
+| 2 | ML evaluation (precision/recall) | **Done.** Offline Isolation Forest (scikit-learn), 8 engineered features, no label leakage, imported idempotently via the same job pattern. Precision 0.560 / Recall 0.667 / F1 0.609 against synthetic ground truth — see `docs/ML_EVALUATION_REPORT.md` for the full methodology and honest limitations. **The actual admin-triggered import into the live app is reserved for the user to run and report**, same boundary as Day 1's synthetic-event import (see "What's verified vs. handed off" below). |
+| 4 | README + architecture diagram | **Not started.** Next up — deliberately last, needs the finished UI for screenshots. |
 
 See `docs/DEBUGGING_LOG.md` for what was actually verified at each step —
 this table tracks scope, not proof; don't treat "Done" here as a
@@ -349,6 +349,93 @@ reference the generated Tailwind utilities (`bg-card`, `text-primary`,
 - **No chart or stat value is invented.** Every number on the dashboard and
   in both charts is derived from the same `authEvents` records the table
   below renders — there is no separate "demo data" path.
+
+## Phase 3: offline Isolation Forest ML integration
+
+The second detection layer promised since Day 1 is now real, not just
+reserved schema columns.
+
+**Pipeline, end to end:**
+
+```
+scripts/ml/train_and_evaluate.py  (run once, by hand, offline — never in the Worker)
+  reads  src/data/synthetic-auth-events.json   (the SAME canonical dataset
+                                                 the TS import job uses —
+                                                 one dataset, never two)
+  → scripts/ml/features.py: engineer_features()  (8 numeric features,
+    NEVER reads groundTruthAnomaly/groundTruthReason)
+  → sklearn IsolationForest (n_estimators=200, contamination=0.05,
+    random_state=42 — fully reproducible)
+  → normalizes scores to [0, 1], higher = more anomalous (matches
+    statAnomalyScore's convention)
+  → evaluates against groundTruthAnomaly — the ONLY place labels are read
+    in the entire pipeline, after scoring is complete
+  writes src/data/ml-scores.json          (committed — one row per event,
+                                            keyed by the same stable
+                                            eventId used throughout the app)
+  writes docs/ML_EVALUATION_REPORT.md     (committed — this run's real
+                                            numbers, generated, not
+                                            hand-written)
+
+src/jobs.ts: import-ml-scores            (admin-gated background job,
+                                            same AppJobRoom.authorizeWrite
+                                            check as every other job)
+  → tools.update('authEvents', eventId, { mlAnomalyScore, mlIsOutlier })
+    for every scored event — UPDATE only, never create, so it can never
+    duplicate a row, and the partial-patch merge means statAnomalyScore/
+    statReasons (written by a completely different job) are never touched
+
+/dashboard, /admin                       (display both scores side by
+                                            side, with an explicit note on
+                                            what each one is and isn't)
+```
+
+**Why offline, not a live model in the Worker.** Cloudflare Workers run
+JavaScript/Wasm — there's no Python runtime in the deployed app, so a
+"live" scikit-learn model in production isn't an option DeepSpace offers,
+not an oversight. The model is trained and scored once, by a human running
+a script, and only its numeric output ever reaches the app. The dashboard
+is explicit about this distinction (see the note in the event detail
+modal) — never presenting a precomputed score as if it were computed live.
+
+**No data leakage, enforced structurally.** `engineer_features()` in
+`scripts/ml/features.py` doesn't just avoid reading
+`groundTruthAnomaly`/`groundTruthReason` by convention — a test
+(`test_engineer_features_never_reads_ground_truth`) passes events that
+don't have those keys **at all** and confirms feature engineering still
+works, proving the function structurally cannot depend on them.
+
+**Idempotency and non-corruption, also structural, not just tested.**
+`tools.update` is documented to refuse to create a row that doesn't
+exist — "updates never create" — so `import-ml-scores` literally cannot
+produce a duplicate, the same hard guarantee the SDK itself provides.
+Because the patch object only ever contains `mlAnomalyScore`/`mlIsOutlier`,
+and partial patches merge rather than overwrite the whole row, a repeat
+(or out-of-order) run can't touch `statAnomalyScore`/`statReasons` — those
+are owned entirely by the separate `recompute-stat-scores` job.
+
+**What's verified vs. handed off.** Same boundary as Day 1's synthetic
+import: I can and did verify the entire Python pipeline (14 tests, a real
+training run, byte-identical reproducibility across two runs), the TS
+job's logic (type-checked, code-reviewed against the SDK's documented
+`update`-never-creates guarantee), and that a non-admin's direct-WebSocket
+attempt to enqueue `import-ml-scores` is refused. What I have **not**
+done is click the real "Import ML scores" button as the real app owner —
+test accounts can never be admin, so that step is reserved for the user,
+exactly like Day 1. See the Phase 3 report for the exact handoff
+instructions.
+
+**Results on this dataset (full methodology, features, and limitations in
+`docs/ML_EVALUATION_REPORT.md`):** Precision 0.560, Recall 0.667, F1
+0.609. The model catches 100% of the injected `impossible_travel` and
+`brute_force_burst` patterns but only 17.6% of `new_device_odd_hour` —
+device novelty alone turned out to be a weaker isolation signal than
+geographic/temporal novelty, a genuine (and informative) finding, not a
+tuned-to-look-good number. These numbers describe how well an unsupervised
+model recovers three known, author-injected synthetic patterns in a small
+dataset — **not** a measure of real-world detection accuracy; the full
+report's limitations section is the authoritative statement of what these
+numbers do and don't mean.
 
 ## Known risks / limitations (living list)
 

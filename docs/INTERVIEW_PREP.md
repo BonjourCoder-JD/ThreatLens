@@ -194,6 +194,77 @@ reopened it. Constraints to work within:
   case you resolve, then reopen, should show the system note in its thread
   without a page refresh.
 
+## Phase 3 (ML): the six things you were asked to be able to explain
+
+**1. How Isolation Forest works.** Random trees, random splits. A normal
+point takes many splits to end up alone in a leaf; an unusual point gets
+isolated in far fewer, because a random cut is likelier to separate an
+extreme value fast. Average isolation-path length across all trees,
+inverted, is the anomaly score. No labels anywhere in that process —
+practice saying "it finds structure, I never tell it what anomalous means."
+
+**2. Why offline inference was chosen.** Not a preference — a hard
+constraint. Cloudflare Workers run JS/Wasm; there is no Python runtime in
+the deployed app. The model runs once, by a human, outside the app; only
+its numeric output (score + flag per event) ever reaches DeepSpace, via
+the same admin-gated background-job pattern as every other bulk operation
+in this app.
+
+**3. How features are generated.** Eight numeric features per event,
+computed per-actor from their own history (`scripts/ml/features.py`):
+time-of-day/weekend, failed/success, gap since the actor's previous event,
+geographic distance and implied speed from their previous event, device
+novelty, and a rolling failed-login count. Skewed ones get a `log1p`
+transform. None of it touches the ground-truth labels — practice pointing
+at `test_engineer_features_never_reads_ground_truth` as the proof, not
+just the design.
+
+**4. How scores are mapped to events.** Every feature row and every score
+is keyed by the dataset's stable `eventId` — the same id used as the
+DeepSpace `recordId` throughout the whole app. `ml-scores.json` is a flat
+list of `{eventId, mlAnomalyScore, mlIsOutlier}`; the import job does one
+`tools.update('authEvents', eventId, {...})` per row. There's no
+"matching" logic to get wrong because the key was chosen to be the same
+key everywhere, on purpose, back on Day 1.
+
+**5. How precision and recall are calculated.** Standard binary
+classification against `groundTruthAnomaly`: precision = TP/(TP+FP) — of
+everything the model flagged, how much was really injected; recall =
+TP/(TP+FN) — of everything actually injected, how much the model caught.
+Both computed with `sklearn.metrics` against the model's `mlIsOutlier`
+flag, not the continuous score. Practice reciting the confusion matrix
+numbers from `docs/ML_EVALUATION_REPORT.md` (TN=936, FP=22, FN=14, TP=28)
+and deriving precision/recall from them by hand on a whiteboard.
+
+**6. What limitations exist with synthetic data.** Lead with this, don't
+wait to be asked: the three patterns are the same ones the generator
+injects, so the model is finding patterns its own author already knows
+are there; `contamination` was informed by the known injection rate, which
+a real deployment wouldn't have; this is in-sample scoring, not a
+generalization test; and the numbers say nothing about real-world
+detection accuracy. All four are written down in the report's own
+"Limitations" section — know it well enough to summarize unprompted.
+
+### Coding exercise for this phase
+
+Add precision/recall **broken down by ground-truth pattern type**
+(currently the report only shows "flagged rate" per pattern, not a true
+per-pattern precision/recall — those aren't the same number, and the
+difference is the exercise). Specifically:
+
+- For each `groundTruthReason` value (including the implicit "benign"
+  bucket), compute how many of the model's **false positives** came from
+  benign events that happen to share that reason's characteristics — this
+  requires grouping by predicted-vs-actual, not just actual.
+- Write a test with a small synthetic set (4-6 events, 2 reasons, known
+  TP/FP/FN by hand) asserting your per-pattern numbers match a calculation
+  you did with pencil and paper first — not just "the code runs."
+- Decide whether this belongs in `build_report()` (recomputed every run)
+  or as a separate one-off script — and be ready to justify whichever you
+  pick the same way `docs/CODE_WALKTHROUGH.md` justifies every design
+  choice in this project: not "it seemed easier" but a specific tradeoff
+  named out loud.
+
 ## Day 1 learning session (~20-25 min)
 
 Read this once, then close the laptop and try to explain it to someone

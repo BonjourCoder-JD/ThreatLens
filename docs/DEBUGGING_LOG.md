@@ -49,6 +49,39 @@ being tested.
 
 ---
 
+## Phase 3 (ML) — Incident: the evaluation report was corrupted on write
+
+**Error observed.** Reading `docs/ML_EVALUATION_REPORT.md` back after
+generating it showed every em-dash (`—`) replaced with the Unicode
+replacement character (`�`, U+FFFD) — the file was flagged as "not valid
+UTF-8."
+
+**Initial hypothesis.** `Path.write_text(report)` was called with no
+explicit encoding. My hypothesis: on Windows, `write_text()`'s default
+encoding comes from `locale.getpreferredencoding()`, which is commonly
+`cp1252`, not UTF-8 — so every em-dash in the f-string (a character
+`cp1252` can't represent) got mangled on write.
+
+**Investigation.** Confirmed by checking the file with the `file` command
+(reported "Unicode text, UTF-8 text" only AFTER the fix — beforehand it
+would have reported a different/ambiguous encoding) and by re-reading the
+file in Python with `encoding='utf-8'` explicitly, which raised on the
+corrupted bytes before the fix.
+
+**Fix.** Added `encoding="utf-8"` to every `Path.write_text(...)` and
+`open(...)` call across `scripts/ml/` (the report write, the
+`ml-scores.json` write, and every test's dataset/scores file read) —
+never rely on a platform's default text encoding for anything that will
+be committed to a cross-platform repo.
+
+**Test result.** Regenerated the report: `file` reports "UTF-8 text,"
+and a Python re-read with `encoding='utf-8'` succeeds with every em-dash
+intact. Re-ran the full Python suite (14/14) and the training script —
+identical precision/recall/F1 numbers, confirming the fix only touched
+file I/O, not the actual computation.
+
+---
+
 ## Phase 2 (cases) — Incident: test cleanup silently wasn't running
 
 **Error observed.** None — again the dangerous kind. After the full case

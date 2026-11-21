@@ -32,10 +32,24 @@ interface RecomputeResult {
   errors: string[]
 }
 
-type AnyJobResult = ImportResult | RecomputeResult
+interface MlImportResult {
+  modelVersion: string
+  datasetVersion: string
+  totalInDataset: number
+  updated: number
+  failed: number
+  flagged: number
+  errors: string[]
+}
+
+type AnyJobResult = ImportResult | RecomputeResult | MlImportResult
 
 function isRecomputeResult(r: AnyJobResult): r is RecomputeResult {
-  return 'flagged' in r
+  return 'flagged' in r && !('modelVersion' in r)
+}
+
+function isMlImportResult(r: AnyJobResult): r is MlImportResult {
+  return 'modelVersion' in r
 }
 
 export default function AdminPage() {
@@ -46,13 +60,17 @@ export default function AdminPage() {
 
   const importJobs = jobs.filter((j) => j.type === 'import-synthetic-events')
   const recomputeJobs = jobs.filter((j) => j.type === 'recompute-stat-scores')
+  const mlImportJobs = jobs.filter((j) => j.type === 'import-ml-scores')
   const latestImport = importJobs[0]
   const latestRecompute = recomputeJobs[0]
+  const latestMlImport = mlImportJobs[0]
   const importRunning = latestImport?.status === 'queued' || latestImport?.status === 'running'
   const recomputeRunning = latestRecompute?.status === 'queued' || latestRecompute?.status === 'running'
+  const mlImportRunning = latestMlImport?.status === 'queued' || latestMlImport?.status === 'running'
   const flaggedCount = authEvents.filter(
     (r) => Array.isArray((r.data as { statReasons?: unknown[] }).statReasons) && (r.data as { statReasons: unknown[] }).statReasons.length > 0,
   ).length
+  const mlScoredCount = authEvents.filter((r) => (r.data as { mlAnomalyScore?: number }).mlAnomalyScore != null).length
 
   if (!isAdmin) {
     return (
@@ -76,9 +94,10 @@ export default function AdminPage() {
           for the admin role, not just hidden in this UI.
         </p>
 
-        <div className="mb-8 grid grid-cols-2 gap-3">
+        <div className="mb-8 grid grid-cols-2 gap-3 sm:grid-cols-3">
           <StatCard label="Events in authEvents" value={authEvents.length} />
-          <StatCard label="Currently flagged" value={flaggedCount} tone="alert" />
+          <StatCard label="Currently flagged (statistical)" value={flaggedCount} tone="alert" />
+          <StatCard label="Scored by ML model" value={mlScoredCount} />
         </div>
 
         <section className="mb-6 rounded-xl border border-border bg-card p-6 shadow-[0_1px_3px_0_rgba(23,37,84,0.08)]">
@@ -121,13 +140,36 @@ export default function AdminPage() {
 
           <JobList jobs={recomputeJobs} testId="recompute-job-row" renderResult={renderRecomputeResult} />
         </section>
+
+        <section className="mt-6 rounded-xl border border-border bg-card p-6 shadow-[0_1px_3px_0_rgba(23,37,84,0.08)]">
+          <h2 className="mb-1 text-lg font-semibold text-card-foreground">Offline ML scores</h2>
+          <p className="mb-4 text-sm text-muted-foreground">
+            Imports the precomputed Isolation Forest scores (<code>scripts/ml/train_and_evaluate.py</code>,
+            committed at <code>src/data/ml-scores.json</code>) onto matching <code>authEvents</code> rows.
+            Trained and scored entirely offline — nothing here runs Python or a model inside the app. Safe
+            to re-run: it only patches existing rows by their stable event id and never touches statistical
+            scores. See <code>docs/ML_EVALUATION_REPORT.md</code> for methodology, features, and precision/
+            recall against the synthetic ground truth.
+          </p>
+
+          <div className="mb-4 flex items-center gap-3">
+            <Button disabled={mlImportRunning} onClick={() => enqueue('import-ml-scores', {})}>
+              {mlImportRunning ? 'Importing…' : 'Import ML scores'}
+            </Button>
+            <span className="text-sm text-muted-foreground">
+              {status === 'loading' ? 'Loading…' : `${mlScoredCount} of ${authEvents.length} scored`}
+            </span>
+          </div>
+
+          <JobList jobs={mlImportJobs} testId="ml-import-job-row" renderResult={renderMlImportResult} />
+        </section>
       </div>
     </div>
   )
 }
 
 function renderImportResult(result: AnyJobResult): ReactNode {
-  if (isRecomputeResult(result)) return null
+  if (isRecomputeResult(result) || isMlImportResult(result)) return null
   return (
     <span className="text-muted-foreground">
       {result.imported} imported
@@ -141,6 +183,16 @@ function renderRecomputeResult(result: AnyJobResult): ReactNode {
   return (
     <span className="text-muted-foreground">
       {result.flagged} flagged of {result.totalEvents}
+      {result.failed > 0 ? `, ${result.failed} failed` : ''}
+    </span>
+  )
+}
+
+function renderMlImportResult(result: AnyJobResult): ReactNode {
+  if (!isMlImportResult(result)) return null
+  return (
+    <span className="text-muted-foreground">
+      {result.flagged} outliers of {result.totalInDataset}
       {result.failed > 0 ? `, ${result.failed} failed` : ''}
     </span>
   )

@@ -25,6 +25,7 @@ import { createActionTools } from './server/record-tools.js'
 import { computeStatScores, type AuthEventInput } from './lib/anomaly-detection.js'
 import type { Env } from '../worker.js'
 import syntheticDataset from './data/synthetic-auth-events.json'
+import mlScoresDataset from './data/ml-scores.json'
 
 interface SyntheticEvent {
   eventId: string
@@ -160,6 +161,73 @@ async function recomputeStatScores(ctx: JobContext, env: Env): Promise<unknown> 
   return { totalEvents: total, updated, failed, flagged, errors }
 }
 
+interface MlScoreEntry {
+  eventId: string
+  mlAnomalyScore: number
+  mlIsOutlier: number
+}
+
+const mlScores = mlScoresDataset as {
+  modelVersion: string
+  datasetVersion: string
+  generatedAt: string
+  events: MlScoreEntry[]
+}
+
+/**
+ * Imports the offline Isolation Forest scores (scripts/ml/
+ * train_and_evaluate.py's committed output, src/data/ml-scores.json) onto
+ * the matching `authEvents` rows, keyed by the same stable `eventId` the
+ * synthetic import used as the recordId.
+ *
+ * Idempotent and non-corrupting by construction, not just by convention:
+ * `tools.update` can only ever patch an EXISTING row (the SDK's own
+ * `records.update` refuses "no record … — updates never create" if the id
+ * doesn't exist yet — see src/server/record-tools.ts), so a repeat run can
+ * never create a duplicate. And because the patch object here only ever
+ * contains `mlAnomalyScore`/`mlIsOutlier`, the envelope-merge semantics of
+ * `update` (patch fields are merged onto the existing row, not a full
+ * overwrite) mean `statAnomalyScore`/`statReasons` — written by a
+ * completely separate job — are never touched.
+ */
+async function importMlScores(ctx: JobContext, env: Env): Promise<unknown> {
+  const tools = createActionTools(env, env.OWNER_USER_ID, '')
+  const total = mlScores.events.length
+
+  let updated = 0
+  let failed = 0
+  const errors: string[] = []
+
+  for (let i = 0; i < total; i++) {
+    if (ctx.signal.aborted) break
+    const e = mlScores.events[i]
+    const outcome = await tools.update('authEvents', e.eventId, {
+      mlAnomalyScore: e.mlAnomalyScore,
+      mlIsOutlier: e.mlIsOutlier,
+    })
+    if (outcome.success) updated += 1
+    else {
+      failed += 1
+      if (errors.length < 10) errors.push(`${e.eventId}: ${outcome.error}`)
+    }
+
+    if (i % 25 === 0 || i === total - 1) {
+      ctx.progress((i + 1) / total, `${i + 1}/${total} ML scores applied`)
+    }
+  }
+
+  const flagged = mlScores.events.filter((e) => e.mlIsOutlier === 1).length
+  return {
+    modelVersion: mlScores.modelVersion,
+    datasetVersion: mlScores.datasetVersion,
+    totalInDataset: total,
+    updated,
+    failed,
+    flagged,
+    errors,
+  }
+}
+
 export async function runJob(job: Job, ctx: JobContext, env: Env): Promise<unknown> {
   switch (job.type) {
     case 'import-synthetic-events': {
@@ -167,6 +235,9 @@ export async function runJob(job: Job, ctx: JobContext, env: Env): Promise<unkno
     }
     case 'recompute-stat-scores': {
       return recomputeStatScores(ctx, env)
+    }
+    case 'import-ml-scores': {
+      return importMlScores(ctx, env)
     }
     default:
       throw new Error(`Unknown job type: ${job.type}`)
