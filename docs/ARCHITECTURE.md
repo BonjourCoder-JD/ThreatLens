@@ -1,21 +1,26 @@
 # ThreatLens — Architecture
 
-Living document. Updated at the end of each build day. Last updated: **P0 roadmap Phase 3 (offline ML integration)**.
+Living document. Updated at the end of each build day. Last updated: **P0 roadmap Phase 4 (README + architecture diagram) — all five required P0 items complete**.
 
 ## Submission roadmap (tracked — updated after every phase)
 
 Target: stable, fully tested submission by Nov 24-25, 2026 (deadline Nov 26,
-11:59 PM ET). Order is dependency-driven: #1 is small and unblocks nothing
-else; #3 is the biggest lift and #5 can't fully finish without it; #2 is
-independent and substantial; #4 needs final screenshots, so it's last.
+11:59 PM ET). Order was dependency-driven: #1 small and unblocking nothing;
+#3 the biggest lift, #5 couldn't fully finish without it; #2 independent
+and substantial; #4 needed the finished UI for screenshots, so it ran last.
 
 | # | Item | Status |
 |---|---|---|
 | 1 | Better statistical explanations | **Done.** Thresholds embedded in every reason string plus a durable "Detection rule reference" panel; explanation-correctness tests added. |
 | 3 | Case investigation workflow | **Done.** Create-from-event(s), status/priority/assignment, chronological notes, real-time sync — verified with two real signed-in analysts, not mocked. |
 | 5 | Royal-blue UI | **Done.** Dashboard, admin, and case screens share the same theme tokens and components; responsive and accessible. ML scores display alongside statistical scores with a clear explanation of what each represents. |
-| 2 | ML evaluation (precision/recall) | **Done.** Offline Isolation Forest (scikit-learn), 8 engineered features, no label leakage, imported idempotently via the same job pattern. Precision 0.560 / Recall 0.667 / F1 0.609 against synthetic ground truth — see `docs/ML_EVALUATION_REPORT.md` for the full methodology and honest limitations. **The actual admin-triggered import into the live app is reserved for the user to run and report**, same boundary as Day 1's synthetic-event import (see "What's verified vs. handed off" below). |
-| 4 | README + architecture diagram | **Not started.** Next up — deliberately last, needs the finished UI for screenshots. |
+| 2 | ML evaluation (precision/recall) | **Done.** Offline Isolation Forest (scikit-learn), 8 engineered features, no label leakage, imported idempotently via the same job pattern. Precision 0.560 / Recall 0.667 / F1 0.609 against synthetic ground truth, independently recomputed from the raw data and confirmed matching — see `docs/ML_EVALUATION_REPORT.md`. **The actual admin-triggered import into the live app is reserved for the user to run and report**, same boundary as Day 1's synthetic-event import. |
+| 4 | README + architecture diagram | **Done.** `README.md` — problem statement, real screenshots (captured from the running app, not illustrative), a Mermaid architecture diagram, tech stack, DeepSpace capabilities, local dev/testing/deployment instructions, and the ML evaluation summary with its limitations. `docs/SUBMISSION_NOTE.md` — a draft submission note with explicit, checkbox-tracked distinction between what's been personally verified and what's still open. |
+
+**All five required (P0) roadmap items are now complete.** Optional
+stretch items (CSV export, additional charts) remain explicitly out of
+scope unless separately approved — see `README.md`'s "Known limitations &
+possible future work."
 
 See `docs/DEBUGGING_LOG.md` for what was actually verified at each step —
 this table tracks scope, not proof; don't treat "Done" here as a
@@ -389,6 +394,24 @@ src/jobs.ts: import-ml-scores            (admin-gated background job,
                                             side, with an explicit note on
                                             what each one is and isn't)
 ```
+
+**Persistence**: scores live as two plain columns on the existing
+`authEvents` RecordRoom schema (`mlAnomalyScore: number`, `mlIsOutlier: {
+kind: 'boolean' }`, both declared since Day 1 — no migration for this
+phase). They're ordinary fields on an ordinary collection; nothing about
+ML scoring required a new collection, a new permission, or a schema
+change. Reading them is just `useQuery('authEvents', ...)`, the same
+subscription the dashboard already had.
+
+**The exact score contract** (range, direction, and how the outlier flag
+is actually computed — verified against the installed scikit-learn
+library and the real committed data, not assumed) is documented in full
+in `docs/CODE_WALKTHROUGH.md`'s "Understanding ThreatLens ML Scores"
+section. Short version: `mlAnomalyScore` is a `[0, 1]` float where higher
+means more anomalous (confirmed: the real data's min/max are exactly 0.0
+and 1.0); `mlIsOutlier` is NOT a threshold on that score — it's
+scikit-learn's own `predict()` output, derived from `contamination` at
+fit time, independently computed and merely stored alongside the score.
 
 **Why offline, not a live model in the Worker.** Cloudflare Workers run
 JavaScript/Wasm — there's no Python runtime in the deployed app, so a

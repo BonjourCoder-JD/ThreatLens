@@ -49,6 +49,50 @@ being tested.
 
 ---
 
+## Phase 3 (ML) — Verification pass: documenting score semantics (no new bugs found)
+
+Before writing "Understanding ThreatLens ML Scores"
+(`docs/CODE_WALKTHROUGH.md`), the implementation was re-inspected and
+cross-checked rather than documented from memory, specifically because
+score direction/range/threshold claims are easy to get subtly wrong.
+Recorded here in the interest of "document genuine issues, don't invent
+bugs" — this is the honest result of that check: **no discrepancy was
+found.**
+
+What was verified, and how:
+
+- **Which scikit-learn API is actually called.** Grepped
+  `train_and_evaluate.py` fresh: confirmed `model.decision_function(...)`
+  is used for the continuous score (not `score_samples()`), and
+  `model.predict(...)` is a separate call for the binary flag.
+- **The direction/range claim.** Read the *installed* scikit-learn
+  1.9.1's own docstring for `IsolationForest.decision_function` via
+  `help()` rather than relying on general knowledge of the library:
+  confirms "the lower, the more abnormal" in the raw score, which matches
+  what the code's inline comment already claimed before this check.
+- **The stored score's actual range.** Loaded the real committed
+  `src/data/ml-scores.json` and computed `min()`/`max()` directly: exactly
+  `0.0` and `1.0` across all 1,000 events, confirming the min-max
+  normalization behaves as documented.
+- **Where the outlier threshold actually falls.** Computed directly from
+  the real data: the lowest score among `mlIsOutlier: 1` rows is 0.7058;
+  the highest among `mlIsOutlier: 0` rows is 0.6992 — a clean gap, and
+  **not** a round number anywhere in the code (it's an emergent property
+  of this run's score distribution, not a configured constant).
+- **The reported precision/recall/F1 numbers.** Independently recomputed
+  TP/FP/TN/FN and precision/recall/F1 directly from the two raw JSON
+  files, in a fresh one-off script that does not import or reuse
+  `train_and_evaluate.py`'s own calculation. Result: **TP=28, FP=22,
+  TN=936, FN=14, precision=0.5600, recall=0.6667, F1=0.6087** — matches
+  `docs/ML_EVALUATION_REPORT.md`'s reported 0.560/0.667/0.609 exactly (to
+  rounding). The per-pattern breakdown (100%/100%/17.6%/2.3%) also
+  matched exactly. No correction was needed.
+
+**Outcome: the existing report's numbers stand, independently confirmed,
+not just re-trusted.**
+
+---
+
 ## Phase 3 (ML) — Incident: the evaluation report was corrupted on write
 
 **Error observed.** Reading `docs/ML_EVALUATION_REPORT.md` back after

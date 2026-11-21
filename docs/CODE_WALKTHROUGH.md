@@ -1236,6 +1236,238 @@ Then re-check `docs/ML_EVALUATION_REPORT.md`'s numbers actually changed
 
 ---
 
+## Understanding ThreatLens ML Scores
+
+This section documents exactly how the ML score pipeline behaves, verified
+directly against the installed library and the actual committed data — not
+assumed from how Isolation Forest is "supposed to" work. Every specific
+number below (the score range, the threshold location, the worked
+examples) was read out of `src/data/ml-scores.json` and
+`src/data/synthetic-auth-events.json` with a one-off script, not estimated.
+Where a claim is about *this run's data* rather than Isolation Forest in
+general, it's labeled as such.
+
+### 1. What Isolation Forest is and how it detects anomalies
+
+An **unsupervised** ensemble model: it builds many random binary trees
+over the feature space, and never sees a label (not even at training
+time — `scikit-learn`'s `IsolationForest.fit(X)` takes no `y`). It finds
+structure in the features alone.
+
+### 2. How isolation trees separate normal and unusual observations
+
+Each tree picks a random feature and a random split value, repeatedly,
+until every point is alone in its own leaf. A "normal" point — similar to
+many others — tends to need many splits to isolate, because it's
+surrounded by similar points that a random cut is likely to group it
+with. An unusual point — extreme on some feature — tends to get isolated
+in very few splits, because a random cut is much more likely to separate
+it from everything else on the first or second try. **Average path length
+to isolation, across all trees, is the raw signal**; short average paths
+mean "easy to isolate," i.e. anomalous.
+
+### 3. The eight engineered features (`scripts/ml/features.py`)
+
+| # | Feature | Calculation | Purpose |
+|---|---|---|---|
+| 1 | `hour_of_day` | `datetime.fromtimestamp(ts, utc).hour` — 0-23 | Captures an actor's normal time-of-day pattern. |
+| 2 | `is_weekend` | 1.0 if `weekday() >= 5` else 0.0 | Weekday vs. weekend login patterns can differ. |
+| 3 | `is_failed` | 1.0 if `not success` else 0.0 | A failed attempt is inherently more noteworthy. |
+| 4 | `minutes_since_prev_event` | `(ts - prev_ts) / 60`, floored at 1 second, capped at 10,080 (7 days) — the cap value is also the sentinel for an actor's very first event, which has no "previous" | Very short gaps can indicate automation or a burst. |
+| 5 | `distance_km_from_prev` | Haversine distance between this event's city and the actor's immediately preceding event's city (0.0 for a first event or same city) | The core geographic-novelty signal. |
+| 6 | `implied_speed_kmh` | `distance_km_from_prev / elapsed_hours`, capped at 5,000 | Turns raw distance into a travel-plausibility signal; the cap stops a near-zero elapsed time from producing a near-infinite value. |
+| 7 | `is_new_device` | 1.0 if this device was never seen before in the actor's own history (0.0 for the actor's first event — there's no baseline to compare against yet) | Device novelty relative to that specific actor. |
+| 8 | `failed_logins_last_15min` | Count of the actor's `failed_login` events (including this one, if it's a failure) within the trailing 900 seconds | A continuous analogue of the statistical detector's burst rule. |
+
+**Preprocessing**: features 4-6 are right-skewed (a 10,080-minute sentinel
+sitting next to mostly-small gaps; a handful of >1,000 km/h speeds next to
+mostly-zero values), so each gets `np.log1p()` applied before the model
+sees it (`train_and_evaluate.py`'s `transform_features()`). No categorical
+one-hot encoding is used anywhere.
+
+**No ground truth anywhere in this step** — `engineer_features()` doesn't
+accept, read, or require `groundTruthAnomaly`/`groundTruthReason`; see
+`test_engineer_features_never_reads_ground_truth`.
+
+### 4-8. Exactly how the score is produced — verified against the installed library, not assumed
+
+Read directly from `train_and_evaluate.py`'s `fit_and_score()`:
+
+```python
+raw = model.decision_function(X_transformed)        # NOT score_samples()
+inverted = -raw
+normalized = (inverted - inverted.min()) / (inverted.max() - inverted.min())
+predictions = model.predict(X_transformed)           # separate call
+is_outlier = (predictions == -1).astype(int)
+```
+
+**ThreatLens uses `decision_function()`, not `score_samples()`.** The
+installed scikit-learn's own docstring for `IsolationForest.decision_function`
+(confirmed by running `help()` against the actual installed package,
+version 1.9.1) states:
+
+> "The anomaly score of the input samples. **The lower, the more
+> abnormal. Negative scores represent outliers, positive scores represent
+> inliers.**"
+
+So in scikit-learn's own raw output: **lower (and negative) = more
+anomalous**. ThreatLens then does two transformations before storing
+anything:
+
+1. **Inverts the sign** (`-raw`), so now higher = more anomalous.
+2. **Min-max normalizes to exactly [0, 1]** across the whole scored
+   dataset.
+
+**The stored `mlAnomalyScore` therefore has this exact, verified
+contract: a float in `[0.0, 1.0]`, where higher means more anomalous.**
+Confirmed empirically: across all 1,000 scored events in the committed
+`ml-scores.json`, the minimum score is exactly `0.0` and the maximum is
+exactly `1.0` (that's what min-max normalization guarantees by
+construction, not a coincidence).
+
+**`mlIsOutlier` is NOT computed by thresholding `mlAnomalyScore`.** It
+comes from a **separate** call, `model.predict(X)`, which returns `-1`
+for an outlier and `1` for an inlier using scikit-learn's own internal
+decision boundary — derived at fit time from the `contamination=0.05`
+parameter (scikit-learn sets an internal `offset_` such that the
+requested fraction of the fitted data falls on the outlier side of raw
+`decision_function() < 0`). `is_outlier = (predictions == -1)`.
+
+**Where does that boundary land in the stored, normalized score, in this
+actual run?** Checked directly against the committed data: the lowest
+score among events marked `mlIsOutlier: 1` is **0.7058**; the highest
+score among events marked `mlIsOutlier: 0` is **0.6992**. There is a clean
+gap between them — no event scores between 0.6992 and 0.7058 in this run.
+**This boundary is not a fixed constant anywhere in the code** — it's
+wherever scikit-learn's contamination-based decision happens to fall
+after min-max normalization, for this specific fitted model on this
+specific dataset. A different run (different data, different
+`contamination`, even a different `n_estimators`) could place it
+somewhere else. If you need "is this score above the model's own outlier
+line," read `mlIsOutlier` — don't hardcode 0.70 anywhere.
+
+Exactly **50 of 1,000** events are flagged (`mlIsOutlier: 1`) — precisely
+5.0%, matching `contamination=0.05` by construction (that parameter
+directly controls how many points `predict()` calls outliers).
+
+### 9. How the offline model's results are matched to authentication events
+
+By the dataset's stable `eventId` string (e.g. `evt_000026`) — the exact
+same id used as the authEvents `recordId` everywhere else in the app.
+`ml-scores.json` is a flat array of `{eventId, mlAnomalyScore,
+mlIsOutlier}`; there is no separate "matching" or "linking" logic to
+inspect — the key was chosen on Day 1 specifically so that none would
+ever be needed.
+
+### 10. How the ML scores are imported into RecordRoom
+
+`src/jobs.ts`'s `importMlScores()` (job type `import-ml-scores`, same
+admin-only `AppJobRoom.authorizeWrite` gate as every other job) loops over
+every entry in the committed `ml-scores.json` and calls
+`tools.update('authEvents', eventId, { mlAnomalyScore, mlIsOutlier })` —
+one `update` per event, nothing else. `update` (not `create`) is the
+reason a repeat run cannot duplicate a row (scikit-learn... no — the
+SDK's own `records.update` refuses to create a row that doesn't exist),
+and because the patch only names these two fields, the envelope-merge
+semantics of `update` leave `statAnomalyScore`/`statReasons` — written by
+the completely separate `recompute-stat-scores` job — untouched.
+
+### 11. How the dashboard displays and filters ML results
+
+`src/pages/(app)/(protected)/dashboard.tsx` reads `mlAnomalyScore`/
+`mlIsOutlier` straight off each `authEvents` record (no recomputation in
+the browser). Three places:
+
+- **Table column** ("ML score"): shows `mlAnomalyScore.toFixed(2)` in a
+  badge — `destructive` (red) if `mlIsOutlier === 1`, `secondary`
+  (neutral) otherwise. Shows an em-dash if the row hasn't been scored yet
+  (`mlAnomalyScore == null`).
+- **"ML outliers only" filter** (`mlOutlierOnly` state): filters directly
+  on `r.data.mlIsOutlier === 1` — the model's own flag, not a
+  dashboard-chosen threshold on the score.
+- **Detail modal**: shows the statistical score and the ML score
+  side by side, each labeled, plus a fixed explanatory note (see point 12
+  below) distinguishing what each one is.
+
+Note the ML badge is simpler than the statistical one: `scoreBadgeVariant`
+(used for `statAnomalyScore`) has three tiers (clean/warning/high); the ML
+badge only has two (outlier/not), because `mlIsOutlier` is already a
+binary flag — there's no separate "medium ML risk" tier anywhere in the
+code.
+
+### 12. How ML detection differs from statistical rule-based detection
+
+| | Statistical (`src/lib/anomaly-detection.ts`) | ML (this section) |
+|---|---|---|
+| Runs | Live, inside the app, on every recompute | Once, offline, outside the app |
+| Logic | Three named, human-readable rules with fixed thresholds | A model that finds its own structure in 8 numeric features |
+| Output | A score that's literally the sum of matched rule weights, plus a list of reasons | A single float plus a binary flag, with no "reason" beyond "the features put this point in isolation quickly" |
+| Explainability | Exact — `statReasons` names precisely which rule(s) fired and why | None at the per-event level — there's no equivalent of `statReasons` for the ML score |
+
+### 13. Why the two systems can disagree
+
+They're built from different information in different ways, so agreement
+is expected, not guaranteed. Concretely, in this run (verified against the
+committed data, not a general claim): the ML model catches **100%** of
+`impossible_travel` and `brute_force_burst` events but only **17.6%**
+(3 of 17) of `new_device_odd_hour` events — because a *single* binary
+feature (`is_new_device`) spread among seven other features that are
+mostly unremarkable for those events doesn't isolate the point as
+strongly as a very large `implied_speed_kmh` or a very high
+`failed_logins_last_15min` does. The statistical detector, by contrast,
+catches a new device 100% of the time by rule-definition (minus the
+actor's-first-event exemption) — it isn't weighing that signal against
+seven others, it's just checking it directly.
+
+### 14. Why an ML score is NOT a probability that an event is malicious
+
+Three concrete reasons, not just a disclaimer:
+
+- **It's a relative, in-sample measure.** The min-max normalization (step
+  4-8 above) divides by *this dataset's own* min/max isolation depth —
+  the number `0.73` means "more isolated than most other events in this
+  specific 1,000-row run," not any absolute probability of maliciousness.
+  Re-score a different dataset and the same underlying event could
+  normalize to a different number.
+- **The model has no concept of "malicious."** It was never shown a
+  single label. "Isolated easily" and "malicious" are a hypothesis this
+  project is testing (and partially confirming — see the precision/recall
+  numbers), not a guarantee built into the math.
+- **The outlier flag depends on an assumed contamination rate.** `0.05`
+  came from the known injection rate of this synthetic dataset — a
+  choice, not a discovered fact — so the flag answers "is this among the
+  most unusual ~5% of this dataset," which is a different question from
+  "how likely is this to be a real attack."
+
+### Worked examples (real values, from the committed data — not illustrative)
+
+**Example A — the most normal event in the dataset.**
+`evt_000590`: actor `user_005`, an ordinary `login` from Berlin on
+macOS-Safari. `mlAnomalyScore = 0.0` (the literal minimum in this run),
+`mlIsOutlier = 0`. Ground truth agrees: `groundTruthAnomaly = 0`. Nothing
+about this event stood out on any of the 8 features.
+
+**Example B — the most anomalous event in the dataset, correctly caught.**
+`evt_000026`: actor `user_045`, a `failed_login` from Lagos on
+Android-App. `mlAnomalyScore = 1.0` (the literal maximum), `mlIsOutlier =
+1`. Ground truth: `groundTruthAnomaly = 1`, `groundTruthReason =
+brute_force_burst` — a true positive, and specifically the single
+easiest-to-isolate point in the whole dataset (likely a high
+`failed_logins_last_15min` combined with an unusual `is_new_device`/
+location signal for that actor).
+
+**Example C — a real false negative, illustrating the recall gap from
+point 13.** `evt_000036`: actor `user_043`, ground truth
+`groundTruthReason = new_device_odd_hour` (a real injected anomaly) —
+but `mlAnomalyScore = 0.5635`, well below the ~0.706 boundary, so
+`mlIsOutlier = 0`. The statistical detector *would* catch this one (new
+device is new device, by rule), but the ML model's isolation-based score
+wasn't pushed high enough by that one feature alone. This is the single
+clearest concrete illustration of why `new_device_odd_hour` has only
+17.6% recall in the evaluation report.
+
+---
+
 ## AI-assisted code: how it was verified
 
 Every piece of SDK usage above was checked against the documented contract

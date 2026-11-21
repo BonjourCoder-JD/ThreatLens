@@ -194,6 +194,228 @@ reopened it. Constraints to work within:
   case you resolve, then reopen, should show the system note in its thread
   without a page refresh.
 
+## Explaining Isolation Forest and ML Scores
+
+### The 30-second explanation
+
+"We added a second, independent anomaly detector alongside the rule-based
+one. It's a scikit-learn Isolation Forest — an unsupervised model that
+isolates unusual data points by how few random splits it takes to
+separate them from everything else. It runs once, offline, outside the
+app — Cloudflare Workers can't run Python — and only its output, a score
+and a flag per event, gets imported into DeepSpace. We evaluated it
+against synthetic ground-truth labels: precision 0.56, recall 0.67, and
+it's upfront in the docs that those numbers describe this synthetic
+dataset, not real-world accuracy."
+
+### The two-minute technical explanation
+
+"Isolation Forest builds many random binary trees over the feature space.
+A normal point is surrounded by similar points, so a tree needs many
+splits to isolate it alone; an unusual point gets isolated in very few
+splits, because a random cut is more likely to separate an extreme value
+quickly. Average isolation depth across all trees is the signal — short
+paths mean anomalous.
+
+"We engineer 8 features per event from the actor's own history — time of
+day, success/failure, gap since their last event, distance and implied
+speed from their last login, device novelty, and a rolling failed-login
+count — all computed in a pure Python module with zero access to the
+ground-truth labels, which a test enforces structurally, not just by
+convention.
+
+"Scikit-learn's `decision_function()` gives a raw score where, by its own
+documentation, lower means more abnormal. We invert that and min-max
+normalize it to exactly [0, 1], so higher means more anomalous — verified
+against the real output, not assumed. The binary outlier flag is a
+separate call, `model.predict()`, driven by a `contamination=0.05`
+parameter we set from the dataset's own known injection rate — which is
+itself a disclosed simplification, since a real deployment wouldn't know
+that in advance.
+
+"We evaluate against the synthetic ground truth only at the very end,
+after scoring: precision 0.56, recall 0.67, F1 0.61. The model catches
+100% of two of the three injected patterns but only 17.6% of the third —
+new-device novelty alone is a weaker isolation signal than a large
+geographic jump or a login burst. That's a real, informative finding
+about the feature set, not something we tuned away.
+
+"The whole thing runs once, by hand, in a Python venv that never ships —
+the deployed app only ever imports a static JSON file of scores, the same
+admin-gated background-job pattern used everywhere else in this app for
+bulk data operations."
+
+### At least 10 realistic interview questions, with technically accurate answers
+
+1. **"Does Isolation Forest need labeled training data?"** No — `.fit(X)`
+   takes no `y`. It's purely unsupervised; the labels are used only
+   afterward, for evaluation.
+2. **"What's the actual score your app stores, and what's its range?"**
+   `mlAnomalyScore`, a float in exactly `[0.0, 1.0]`, higher = more
+   anomalous — derived from `-decision_function()`, min-max normalized.
+   Verified against the real committed data: the min and max are
+   literally 0.0 and 1.0.
+3. **"Is the outlier flag just `score > 0.5`?"** No — that's a common
+   wrong guess. `mlIsOutlier` comes from a separate `model.predict()`
+   call, using scikit-learn's own `contamination`-derived decision
+   boundary, not a hand-picked threshold on the stored score.
+4. **"Why `decision_function()` instead of `score_samples()`?"**
+   `decision_function()` already incorporates the fitted
+   `contamination`-based offset (so 0 is meaningfully "the boundary"),
+   which lines up with wanting a score whose sign/magnitude already
+   reflects the chosen contamination; `score_samples()` is the more raw,
+   offset-free form. (Honest follow-up if pushed further: both are
+   monotonic transforms of the same underlying isolation depth, so the
+   *ranking* of events would be identical either way — the choice mainly
+   affected convenience of deriving the final normalization, not which
+   events end up more or less anomalous relative to each other.)
+5. **"How do you prevent data leakage?"** `engineer_features()` never
+   receives `groundTruthAnomaly`/`groundTruthReason` — a test passes
+   events where those keys are entirely absent and confirms it still
+   works, which is a structural guarantee, not a promise.
+6. **"Why does the model do so much worse on `new_device_odd_hour`?"**
+   Device novelty is one binary feature among eight; the other injected
+   patterns (impossible travel, brute-force burst) push multiple features
+   to extreme values simultaneously (huge implied speed *and* a big
+   distance; a high failed-count *and* repeated short gaps), which
+   isolates faster. One modest binary signal isolates less aggressively.
+7. **"What would change if you didn't know the true contamination rate?"**
+   We'd have to pick a generic default (or tune it some other way), and
+   precision/recall would very likely shift — this is explicitly called
+   out as a disclosed limitation, not hidden.
+8. **"Is this evaluation measuring generalization?"** No — it's in-sample:
+   the model is fit and scored on the same dataset, because there's no
+   "future" data for a static historical dataset. It measures agreement
+   with three known, injected patterns in this dataset, not how the model
+   would do on new, unseen traffic.
+9. **"How does this get from a Python script into the live app?"** The
+   script writes `src/data/ml-scores.json`, committed to the repo. An
+   admin clicks "Import ML scores," which enqueues a background job that
+   does one `tools.update` per event, keyed by the same `eventId` used as
+   the record id everywhere else.
+10. **"What happens if an admin clicks import twice?"** Nothing bad —
+    `tools.update` can only patch an existing row (the SDK's own
+    `records.update` refuses to create one), so it's idempotent by a
+    guarantee from the platform, not just careful coding. And because the
+    patch only touches `mlAnomalyScore`/`mlIsOutlier`, the statistical
+    score fields are never affected.
+11. **"Could you deploy this model to run live, inside the Worker?"** No —
+    Cloudflare Workers run JavaScript/Wasm, not Python; there's no runtime
+    there that could import scikit-learn. That's the actual constraint
+    driving the whole offline-import design, not a stylistic choice.
+
+### Precision, recall, and F1 — how to explain them
+
+- **Precision** = TP / (TP + FP): of everything the model flagged, what
+  fraction was a real injected anomaly? (0.56 here — 28 of the 50 flagged
+  events were real.)
+- **Recall** = TP / (TP + FN): of everything that's actually anomalous,
+  what fraction did the model catch? (0.667 — 28 of 42 real anomalies.)
+- **F1** = 2 × precision × recall / (precision + recall): the harmonic
+  mean, a single number that penalizes a big gap between the two more
+  than a plain average would. (0.609.)
+- Confusion matrix to have memorized: TN=936, FP=22, FN=14, TP=28 (sums
+  to 1,000, the full dataset).
+
+### Why the model performs differently across anomaly types
+
+Already covered above (Q6) — worth being able to say in one sentence:
+"features that move multiple signals at once isolate more aggressively
+than features that move only one."
+
+### Why ML scores are not attack probabilities
+
+Three reasons, memorize all three, not just one: (1) the score is
+min-max-normalized *within this dataset*, so it's relative to this run,
+not an absolute probability; (2) the model never saw a label, so
+"isolated easily" is a hypothesis about maliciousness, not a guarantee
+built into the math; (3) the outlier flag depends on an assumed
+contamination rate that was informed by *knowing* the injection rate —
+a real deployment wouldn't have that luxury.
+
+### How to explain statistical-vs-ML disagreements
+
+Lead with: "they're not supposed to always agree — they're built from
+different information." Then the concrete example: the real false
+negative `evt_000036` (`docs/CODE_WALKTHROUGH.md`'s Example C) — a true
+`new_device_odd_hour` anomaly the statistical detector catches by rule,
+that the ML model scored only 0.56 (below its ~0.706 boundary) because
+device novelty alone didn't isolate it strongly enough among eight
+features. That's a specific, real, nameable disagreement — much stronger
+in an interview than "they can differ in general."
+
+### How to explain the model's limitations and engineering tradeoffs
+
+- Synthetic, author-designed data — the model is finding patterns its own
+  author knows are there.
+- `contamination` informed by the known injection rate, not discovered
+  blind.
+- In-sample scoring, not a generalization test.
+- No adversarial evaluation.
+- The tradeoff of choosing simple, explainable numeric features over a
+  larger, more expressive feature set (e.g. no categorical one-hot
+  encoding) — kept the model's behavior easy to reason about and explain,
+  at the cost of not capturing every possible signal (e.g. country-level
+  risk, which is partially but not fully captured by the distance/speed
+  features).
+
+### Coding exercise 1 — extend a feature, verify it with tests
+
+Add a 9th feature, `is_first_event_for_actor` (0/1) — this currently has
+to be *inferred* from `minutes_since_prev_event` hitting its 10,080
+sentinel value; making it explicit is a reasonable, well-scoped change.
+
+**Instructions:**
+1. Add the feature to `FEATURE_NAMES` and compute it in
+   `engineer_features()` in `scripts/ml/features.py`.
+2. Write at least one test in `test_features.py` asserting it's exactly
+   `1.0` for each actor's first chronological event and `0.0` for every
+   other event of theirs.
+3. Re-run `pytest scripts/ml` — all existing tests should still pass
+   unmodified (adding a feature shouldn't break anything that doesn't
+   reference `FEATURE_NAMES`'s exact length).
+4. Re-run `python scripts/ml/train_and_evaluate.py` and compare the new
+   precision/recall/F1 to the committed report's 0.560/0.667/0.609.
+
+**Expected outcome:** the numbers may shift slightly (a 9th feature
+changes the split geometry) or may barely move — both are legitimate,
+informative results. Don't chase a "better" number; report what actually
+happened and reason about *why*, the same way the project's own report
+treats the `new_device_odd_hour` gap as a finding, not a failure to fix.
+
+**Keep this implementation for yourself to complete** — it's good,
+genuine practice for exactly the kind of live modification a DeepSpace
+interview might ask for.
+
+### Coding exercise 2 — precision, recall, and F1 without scikit-learn
+
+Recompute the confusion matrix and precision/recall/F1 directly from
+`src/data/ml-scores.json` and `src/data/synthetic-auth-events.json`,
+**without calling any `sklearn.metrics` function** — plain loops and
+arithmetic only.
+
+**Instructions:**
+1. Load both JSON files; join them on `eventId`.
+2. For each event, compare `groundTruthAnomaly` (actual) against
+   `mlIsOutlier` (predicted) and increment one of four counters: TP, FP,
+   TN, FN.
+3. Compute `precision = TP / (TP + FP)`, `recall = TP / (TP + FN)`,
+   `f1 = 2 * precision * recall / (precision + recall)`.
+4. Compare your numbers against the committed report's 0.560 / 0.667 /
+   0.609 — they should match exactly (to rounding), since this is the
+   same calculation scikit-learn's metric functions perform internally,
+   just written out by hand.
+
+**Expected outcome:** an exact match. If it doesn't match, the bug is
+almost certainly in how you're joining the two files (check for a typo'd
+key name, or comparing the wrong pair of fields) — that's a more valuable
+debugging exercise than getting it right on the first try.
+
+**Keep this implementation for yourself to complete** as well — this
+exercise is specifically about being able to derive precision/recall/F1
+from first principles on a whiteboard, not about trusting a library
+function.
+
 ## Phase 3 (ML): the six things you were asked to be able to explain
 
 **1. How Isolation Forest works.** Random trees, random splits. A normal
