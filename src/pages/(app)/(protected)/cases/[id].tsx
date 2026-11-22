@@ -1,18 +1,23 @@
 /**
- * Case detail — status/priority/assignment, linked events with their
- * detection explanations, and a chronological note thread.
+ * Case detail — status/severity/priority/assignment, incident
+ * confirmation, linked events with their detection explanations, a
+ * chronological note thread, and a read-only activity history.
  *
- * Status/priority/assignedTo changes go through the `transitionCase`
- * server action, NOT a direct `useMutations.put` — this is the
+ * Status/severity/priority/assignedTo changes go through the
+ * `transitionCase` server action, and incident confirmation through
+ * `confirmIncident` — NOT a direct `useMutations.put` — this is the
  * incident-management extension's actual security boundary.
  * `src/schemas/cases-schema.ts`'s `member.writableFields` now excludes
  * these fields, so a direct client write to any of them is rejected by
- * the Durable Object itself; `transitionCase` is the only path that can
- * still change them, specifically because it goes through the
- * RBAC-bypassing `X-App-Action` mechanism and records an activity entry
+ * the Durable Object itself; the two actions are the only path that can
+ * still change them, specifically because they go through the
+ * RBAC-bypassing `X-App-Action` mechanism and record an activity entry
  * for every change. `summary` and notes remain plain client mutations —
- * nothing about THEM needed to become server-mediated. See
- * docs/ARCHITECTURE.md ("Incident-management extension") for the full
+ * nothing about THEM needed to become server-mediated. The activity
+ * history below is read-only by schema (`caseActivity`'s `create: false`
+ * for every role) and reflects real-time sync the same way every other
+ * `useQuery` on this page does — no separate polling or refresh needed.
+ * See docs/ARCHITECTURE.md ("Incident-management extension") for the full
  * rationale and docs/CODE_WALKTHROUGH.md for the data flow.
  */
 
@@ -40,6 +45,8 @@ interface CaseRecord {
   title: string
   status: string
   priority: string
+  severity?: string
+  confirmedIncidentAt?: string
   assignedTo?: string
   relatedEventIds?: string[]
   summary?: string
@@ -48,6 +55,13 @@ interface CaseRecord {
 interface NoteRecord {
   caseId: string
   body: string
+}
+
+interface ActivityRecord {
+  caseId: string
+  eventType: string
+  fromValue?: string
+  toValue: string
 }
 
 interface AuthEventRecord {
@@ -70,6 +84,38 @@ const STATUS_LABELS: Record<string, string> = {
   false_positive: 'False positive',
 }
 const PRIORITY_OPTIONS = ['low', 'medium', 'high']
+const SEVERITY_OPTIONS = ['low', 'medium', 'high', 'critical']
+const SEVERITY_LABELS: Record<string, string> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  critical: 'Critical',
+}
+
+/**
+ * Renders one activity-log entry as a plain sentence. Pure and
+ * module-level (not a component) so it's trivial to unit-test or call from
+ * a coding-interview exercise without React in the loop.
+ */
+function describeActivity(data: ActivityRecord, getName: (id: string) => string | null | undefined): string {
+  switch (data.eventType) {
+    case 'status_change':
+      return `Status changed from "${STATUS_LABELS[data.fromValue ?? ''] ?? data.fromValue ?? '(none)'}" to "${STATUS_LABELS[data.toValue] ?? data.toValue}"`
+    case 'severity_change':
+      return `Severity changed from "${data.fromValue ? SEVERITY_LABELS[data.fromValue] ?? data.fromValue : '(none)'}" to "${SEVERITY_LABELS[data.toValue] ?? data.toValue}"`
+    case 'priority_change':
+      return `Priority changed from "${data.fromValue ? data.fromValue[0].toUpperCase() + data.fromValue.slice(1) : '(none)'}" to "${data.toValue[0].toUpperCase() + data.toValue.slice(1)}"`
+    case 'assignedTo_change': {
+      const from = data.fromValue ? getName(data.fromValue) ?? 'an unknown user' : 'Unassigned'
+      const to = data.toValue ? getName(data.toValue) ?? 'an unknown user' : 'Unassigned'
+      return `Assignee changed from ${from} to ${to}`
+    }
+    case 'incident_confirmed':
+      return 'Confirmed this case as a security incident'
+    default:
+      return `${data.eventType}: ${data.fromValue ?? '(none)'} → ${data.toValue}`
+  }
+}
 
 export default function CaseDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -87,6 +133,16 @@ export default function CaseDetailPage() {
     orderDir: 'asc',
     limit: 500,
   })
+  const {
+    records: activity,
+    status: activityStatus,
+    error: activityError,
+  } = useQuery<ActivityRecord>('caseActivity', {
+    where: { caseId: id },
+    orderBy: 'createdAt',
+    orderDir: 'asc',
+    limit: 500,
+  })
 
   const { users } = useUsers()
   const { getName } = useUserLookup()
@@ -97,6 +153,7 @@ export default function CaseDetailPage() {
   const [submittingNote, setSubmittingNote] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [confirmingIncident, setConfirmingIncident] = useState(false)
 
   async function handleTransition(field: 'status' | 'severity' | 'priority' | 'assignedTo', value: string) {
     const result = await callAction('transitionCase', { caseId: id, field, value })
@@ -110,6 +167,26 @@ export default function CaseDetailPage() {
       // Non-atomic by design (see src/actions/case-actions.ts); surfaced
       // honestly rather than silently dropped.
       toastError('Change saved, but the activity record failed to save', 'See the Activity tab for a possible gap.')
+    }
+  }
+
+  async function handleConfirmIncident() {
+    if (!id) return
+    setConfirmingIncident(true)
+    try {
+      const result = await callAction('confirmIncident', { caseId: id })
+      if (!result.success) {
+        toastError('Could not confirm incident', result.error)
+        return
+      }
+      const data = result.data as { activityRecorded: boolean }
+      toastSuccess('Case confirmed as a security incident')
+      if (!data.activityRecorded) {
+        // Confirmation itself succeeded — only the activity-log write failed.
+        toastError('Confirmed, but the activity record failed to save', 'See the Activity history below for a possible gap.')
+      }
+    } finally {
+      setConfirmingIncident(false)
     }
   }
 
@@ -166,17 +243,42 @@ export default function CaseDetailPage() {
       <div className="mx-auto max-w-4xl px-6 py-12">
         <div className="mb-6 flex items-start justify-between gap-4">
           <div>
-            <h1 className="text-3xl font-bold tracking-tight text-foreground">{theCase.data.title}</h1>
+            <div className="flex items-center gap-2">
+              <h1 className="text-3xl font-bold tracking-tight text-foreground">{theCase.data.title}</h1>
+              {theCase.data.confirmedIncidentAt && (
+                <Badge variant="destructive" data-testid="case-incident-badge">
+                  Confirmed incident
+                </Badge>
+              )}
+            </div>
             {theCase.data.summary && <p className="mt-2 text-sm text-muted-foreground">{theCase.data.summary}</p>}
+            {theCase.data.confirmedIncidentAt && (
+              <p className="mt-1 text-xs text-muted-foreground">
+                Confirmed as an incident on {new Date(theCase.data.confirmedIncidentAt).toLocaleString()}
+              </p>
+            )}
           </div>
-          {canDelete && (
-            <Button variant="destructive" size="sm" onClick={() => setConfirmingDelete(true)}>
-              Delete case
-            </Button>
-          )}
+          <div className="flex items-center gap-2">
+            {!theCase.data.confirmedIncidentAt && (
+              <Button
+                variant="outline"
+                size="sm"
+                data-testid="confirm-incident-button"
+                onClick={handleConfirmIncident}
+                loading={confirmingIncident}
+              >
+                Confirm as incident
+              </Button>
+            )}
+            {canDelete && (
+              <Button variant="destructive" size="sm" onClick={() => setConfirmingDelete(true)}>
+                Delete case
+              </Button>
+            )}
+          </div>
         </div>
 
-        <div className="mb-6 grid grid-cols-1 gap-4 rounded-xl border border-border bg-card p-5 shadow-[0_1px_3px_0_rgba(23,37,84,0.08)] sm:grid-cols-3">
+        <div className="mb-6 grid grid-cols-1 gap-4 rounded-xl border border-border bg-card p-5 shadow-[0_1px_3px_0_rgba(23,37,84,0.08)] sm:grid-cols-2 lg:grid-cols-4">
           <div>
             <Label className="mb-1 block text-xs text-muted-foreground">Status</Label>
             <Select value={theCase.data.status} onValueChange={(v) => void handleTransition('status', v)}>
@@ -187,6 +289,21 @@ export default function CaseDetailPage() {
                 {STATUS_OPTIONS.map((s) => (
                   <SelectItem key={s} value={s}>
                     {STATUS_LABELS[s]}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div>
+            <Label className="mb-1 block text-xs text-muted-foreground">Severity</Label>
+            <Select value={theCase.data.severity ?? ''} onValueChange={(v) => void handleTransition('severity', v)}>
+              <SelectTrigger data-testid="case-severity-select">
+                <SelectValue placeholder="Not set" />
+              </SelectTrigger>
+              <SelectContent>
+                {SEVERITY_OPTIONS.map((s) => (
+                  <SelectItem key={s} value={s}>
+                    {SEVERITY_LABELS[s]}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -299,6 +416,40 @@ export default function CaseDetailPage() {
               </Button>
             </div>
           </div>
+        </section>
+
+        <section>
+          <h2 className="mb-3 text-sm font-semibold text-foreground">Activity history</h2>
+          <div className="space-y-2" data-testid="case-activity">
+            {activityStatus === 'loading' ? (
+              <p className="text-sm text-muted-foreground">Loading activity…</p>
+            ) : activityStatus === 'error' ? (
+              <p className="text-sm text-destructive">
+                Could not load activity history{activityError ? `: ${activityError}` : '.'}
+              </p>
+            ) : activity.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No activity recorded yet.</p>
+            ) : (
+              activity.map((a) => (
+                <div
+                  key={a.recordId}
+                  data-testid="case-activity-entry"
+                  className="flex flex-wrap items-start justify-between gap-3 rounded-xl border border-border bg-card px-4 py-3 shadow-[0_1px_3px_0_rgba(23,37,84,0.08)]"
+                >
+                  <p className="text-sm text-foreground">{describeActivity(a.data, getName)}</p>
+                  <div className="shrink-0 text-right text-xs text-muted-foreground">
+                    <div className="font-medium text-foreground">{getName(a.createdBy) ?? 'Unknown analyst'}</div>
+                    <div>{new Date(a.createdAt).toLocaleString()}</div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            This reflects every protected-field change that was recorded successfully. A change can, rarely, succeed
+            while its activity entry fails to save — this log is best-effort, not a guaranteed-complete or
+            transactional record (see docs/ARCHITECTURE.md, "Audit consistency").
+          </p>
         </section>
       </div>
 

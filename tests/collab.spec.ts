@@ -36,13 +36,18 @@ test.skip(
  * analysts. Covers the thing a mock can't prove: that a write from one
  * browser's WebSocket actually appears in a second, independent browser's
  * `useQuery` subscription without a refresh — real-time sync, not a
- * simulation of it.
+ * simulation of it. Extended for the incident-management UI (Day 2): B
+ * acts as the non-owner analyst throughout, proving severity changes and
+ * incident confirmation aren't creator-restricted, and the activity-history
+ * section's `useQuery('caseActivity')` is live, not a one-time fetch.
  *
  * Cleans up the case it creates (test data convention: a `__test-` prefixed
  * title, deleted in `finally`) so repeated runs don't accumulate junk rows
  * in the shared dev database.
  */
-test('two analysts: case creation, status/priority sync, and notes sync in real time', async ({ users }) => {
+test('two analysts: case creation, status/severity sync, incident confirmation, activity history, and notes sync in real time', async ({
+  users,
+}) => {
   const [analystA, analystB] = await users(2)
   const caseTitle = `__test-${Date.now()}__ Collab case`
   let caseId: string | null = null
@@ -62,6 +67,10 @@ test('two analysts: case creation, status/priority sync, and notes sync in real 
     caseId = analystA.page.url().split('/cases/')[1]
     await expect(analystA.page.getByRole('heading', { name: caseTitle })).toBeVisible()
 
+    // A brand-new case has no protected-field changes yet — the activity
+    // history's empty state, not its loading or error state.
+    await expect(analystA.page.getByTestId('case-activity')).toContainText('No activity recorded yet.')
+
     // B, independently, sees the new case appear on the list — no refresh.
     await analystB.page.goto('/cases')
     await expect(analystB.page.getByText(caseTitle)).toBeVisible({ timeout: 15_000 })
@@ -74,6 +83,32 @@ test('two analysts: case creation, status/priority sync, and notes sync in real 
     await expect(analystB.page.getByTestId('case-status-select')).toContainText('Investigating', {
       timeout: 15_000,
     })
+    // That status change's activity entry (actor, action, before/after) syncs
+    // to B without a reload — proving the activity log is a live useQuery,
+    // not a one-time fetch.
+    await expect(analystB.page.getByTestId('case-activity-entry').last()).toContainText(
+      'Status changed from "Open" to "Investigating"',
+      { timeout: 15_000 },
+    )
+
+    // A sets severity — B, a non-owner analyst (B did not create this case),
+    // sees it live too. Severity has no default, so B starts on the
+    // placeholder and transitions to an explicit value.
+    await expect(analystB.page.getByTestId('case-severity-select')).toContainText('Not set')
+    await analystA.page.getByTestId('case-severity-select').click()
+    await analystA.page.getByRole('option', { name: 'High', exact: true }).click()
+    await expect(analystB.page.getByTestId('case-severity-select')).toContainText('High', { timeout: 15_000 })
+
+    // B (the non-owner analyst) confirms the incident — proving the action
+    // isn't restricted to the case's creator — and A sees the confirmation
+    // badge, timestamp, and activity entry appear live.
+    await analystB.page.getByTestId('confirm-incident-button').click()
+    await expect(analystA.page.getByTestId('case-incident-badge')).toBeVisible({ timeout: 15_000 })
+    await expect(analystB.page.getByTestId('confirm-incident-button')).toHaveCount(0)
+    await expect(analystA.page.getByTestId('case-activity-entry').last()).toContainText(
+      'Confirmed this case as a security incident',
+      { timeout: 15_000 },
+    )
 
     // A adds a note; B sees it appear live, with A's name attributed.
     const noteBody = `Note from A at ${Date.now()}`
