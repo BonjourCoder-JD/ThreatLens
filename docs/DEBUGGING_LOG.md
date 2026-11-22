@@ -49,6 +49,47 @@ being tested.
 
 ---
 
+## Incident-management Day 1 — Incident: a WebSocket test asserted on the wrong message
+
+**Error observed.** The new "a direct write to a protected field (status)
+is rejected" test failed: `expect(rejected).toBeTruthy()` got `undefined`
+— no `core.error` was found in the captured messages at all, even though
+the write should have been refused.
+
+**Initial hypothesis.** The test's `ws.onmessage` handler called `finish()`
+(close the socket, resolve the promise) on the very FIRST message it
+received, assuming that would be the server's reply to the `core.put`
+attempt. Hypothesis: something else arrives first.
+
+**Investigation.** Grepped the compiled worker for what `AppRecordRoom`
+sends proactively on connect, before processing any client message:
+`this.send(ws, { type: MSG.USER_INFO, payload: registeredUser })` — sent
+unconditionally as part of `onConnect`. My test's raw socket was closing
+itself immediately after receiving THIS message, before the actual
+`core.error` reply to the PUT attempt ever arrived.
+
+**Fix.** Changed the handler to keep listening (collecting every message)
+until it specifically sees `type === 'core.error'`, rather than resolving
+on whatever arrives first. For the companion "summary is still writable"
+test, the opposite fix was needed — an accepted fire-and-forget write has
+no explicit success message to an unsubscribed socket, so that test now
+waits out the full timeout window and confirms no `core.error` ever
+arrived, then independently re-queries the page to confirm the write
+actually took effect (not just "no error seen").
+
+**Test result.** Both tests pass: the protected-field write is confirmed
+rejected (`"FIELD ERROR: Role 'member' cannot modify field 'status'"`,
+case status unchanged on reload) and the unprotected `summary` field is
+confirmed still writable (text visible on reload). Full suite: 10/10.
+
+**Why this matters.** The first version of this test could have passed
+OR failed for the wrong reason depending on timing — a classic "test asserts
+on the wrong thing" trap. Worth remembering for any future raw-WebSocket
+test against a RecordRoom specifically: the first frame after connecting
+is always `MSG.USER_INFO`, not a reply to whatever you just sent.
+
+---
+
 ## Phase 3 (ML) — Verification pass: documenting score semantics (no new bugs found)
 
 Before writing "Understanding ThreatLens ML Scores"

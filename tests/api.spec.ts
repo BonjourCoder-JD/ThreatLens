@@ -137,6 +137,157 @@ dsTest.describe('Job room direct-API authorization', () => {
  * docs/concepts/permissions in the DeepSpace docs for why that's a
  * stronger guarantee than a client-side filter.
  */
+/**
+ * Proves the incident-management extension's actual security boundary:
+ * a direct client write to a protected case field is refused by the
+ * Durable Object itself (`member.writableFields` in
+ * src/schemas/cases-schema.ts), not merely hidden by the UI calling the
+ * `transitionCase` action instead. This bypasses the UI and the action
+ * entirely — a raw `core.put` over the WebSocket, the exact wire message
+ * `useMutations('cases').put(...)` would send.
+ */
+dsTest.describe('Protected case fields (incident-management extension)', () => {
+  dsTest('a direct write to a protected field (status) is rejected, and the value is unchanged', async ({ users }) => {
+    const [analyst] = await users(1)
+    const title = `__test-${Date.now()}__ protected-field lockdown`
+
+    await analyst.page.goto('/dashboard')
+    await analyst.page.getByTestId('filter-flagged-only').click()
+    await dsExpect(analyst.page.getByTestId('event-row').first()).toBeVisible({ timeout: 15_000 })
+    await analyst.page.getByTestId('event-row-select').first().click()
+    await analyst.page.getByTestId('open-case-from-selection').click()
+    await analyst.page.getByTestId('case-title-input').fill(title)
+    await analyst.page.getByTestId('create-case-submit').click()
+    await dsExpect(analyst.page).toHaveURL(/\/cases\/.+/, { timeout: 15_000 })
+    const caseId = analyst.page.url().split('/cases/')[1]
+
+    try {
+      const tokenRes = await analyst.page.request.post('/api/auth/token')
+      const { token } = (await tokenRes.json()) as { token?: string }
+
+      const messages = await analyst.page.evaluate(
+        async ({ token, roomId, caseId }) => {
+          return await new Promise<unknown[]>((resolve) => {
+            const seen: unknown[] = []
+            const ws = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/ws/${roomId}?token=${token}`)
+            const finish = () => {
+              ws.close()
+              resolve(seen)
+            }
+            ws.onopen = () => {
+              ws.send(
+                JSON.stringify({
+                  type: 'core.put',
+                  payload: { collection: 'cases', recordId: caseId, data: { status: 'resolved' } },
+                }),
+              )
+            }
+            ws.onmessage = (ev) => {
+              // The connection's very first message is always MSG.USER_INFO
+              // (sent proactively on connect, before any reply to our PUT) —
+              // keep listening past it for the actual error, rather than
+              // resolving on whatever arrives first.
+              const msg = JSON.parse(ev.data as string) as { type: string }
+              seen.push(msg)
+              if (msg.type === 'core.error') finish()
+            }
+            ws.onerror = () => finish()
+            setTimeout(finish, 6000)
+          })
+        },
+        { token, roomId: jobRoomId(), caseId },
+      )
+
+      const rejected = (messages as Array<{ type: string; payload?: { error?: string } }>).find(
+        (m) => m.type === 'core.error',
+      )
+      dsExpect(rejected).toBeTruthy()
+      dsExpect(rejected?.payload?.error).toContain("cannot modify field 'status'")
+
+      // Independent re-query: the case's status is genuinely unchanged —
+      // not just "no success message arrived."
+      await analyst.page.reload()
+      await dsExpect(analyst.page.getByTestId('case-status-select')).toContainText('Open', { timeout: 15_000 })
+    } finally {
+      await analyst.page.goto(`/cases/${caseId}`).catch(() => {})
+      await analyst.page.getByTestId('case-status-select').waitFor({ state: 'visible', timeout: 10_000 }).catch(() => {})
+      const deleteButton = analyst.page.getByRole('button', { name: 'Delete case' })
+      if (await deleteButton.count()) {
+        await deleteButton.click()
+        await analyst.page.getByRole('button', { name: 'Delete', exact: true }).click()
+      }
+    }
+  })
+
+  dsTest('summary remains directly client-writable — the lockdown is field-specific, not blanket', async ({ users }) => {
+    const [analyst] = await users(1)
+    const title = `__test-${Date.now()}__ summary still writable`
+
+    await analyst.page.goto('/dashboard')
+    await analyst.page.getByTestId('filter-flagged-only').click()
+    await dsExpect(analyst.page.getByTestId('event-row').first()).toBeVisible({ timeout: 15_000 })
+    await analyst.page.getByTestId('event-row-select').first().click()
+    await analyst.page.getByTestId('open-case-from-selection').click()
+    await analyst.page.getByTestId('case-title-input').fill(title)
+    await analyst.page.getByTestId('create-case-submit').click()
+    await dsExpect(analyst.page).toHaveURL(/\/cases\/.+/, { timeout: 15_000 })
+    const caseId = analyst.page.url().split('/cases/')[1]
+
+    try {
+      const tokenRes = await analyst.page.request.post('/api/auth/token')
+      const { token } = (await tokenRes.json()) as { token?: string }
+
+      const messages = await analyst.page.evaluate(
+        async ({ token, roomId, caseId }) => {
+          return await new Promise<unknown[]>((resolve) => {
+            const seen: unknown[] = []
+            const ws = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/ws/${roomId}?token=${token}`)
+            const finish = () => {
+              ws.close()
+              resolve(seen)
+            }
+            ws.onopen = () => {
+              ws.send(
+                JSON.stringify({
+                  type: 'core.put',
+                  payload: { collection: 'cases', recordId: caseId, data: { summary: 'direct write of an unprotected field' } },
+                }),
+              )
+            }
+            // A permitted fire-and-forget write has no explicit "success"
+            // ack to an unsubscribed socket — proving it wasn't rejected
+            // means waiting out the full window and confirming no
+            // core.error ever arrived, not finishing on the first message
+            // (which is always the connection's proactive MSG.USER_INFO).
+            ws.onmessage = (ev) => {
+              seen.push(JSON.parse(ev.data as string))
+            }
+            ws.onerror = () => finish()
+            setTimeout(finish, 3000)
+          })
+        },
+        { token, roomId: jobRoomId(), caseId },
+      )
+
+      const rejected = (messages as Array<{ type: string }>).find((m) => m.type === 'core.error')
+      dsExpect(rejected).toBeUndefined()
+
+      // Positive confirmation, not just "no error arrived": the write
+      // actually took effect.
+      await analyst.page.reload()
+      await dsExpect(analyst.page.getByText('direct write of an unprotected field')).toBeVisible({ timeout: 15_000 })
+    } finally {
+      await analyst.page.goto(`/cases/${caseId}`).catch(() => {})
+      await analyst.page.getByTestId('case-status-select').waitFor({ state: 'visible', timeout: 10_000 }).catch(() => {})
+      const deleteButton = analyst.page.getByRole('button', { name: 'Delete case' })
+      if (await deleteButton.count()) {
+        await deleteButton.click()
+        await analyst.page.getByRole('button', { name: 'Delete', exact: true }).click()
+      }
+    }
+  })
+})
+
 dsTest.describe('Case RBAC', () => {
   dsTest('a non-owner analyst cannot delete another analyst\'s case over the raw WebSocket', async ({ users }) => {
     const [owner, other] = await users(2)
@@ -228,6 +379,152 @@ dsTest.describe('Case RBAC', () => {
         }
       } catch {
         // Best-effort cleanup — never let it mask the test's own result.
+      }
+    }
+  })
+})
+
+/**
+ * Integration-level tests against the REAL server action (not the fake
+ * `tools` in src/actions/case-actions.test.ts) — these prove the action is
+ * actually wired up and reachable end to end, complementing the unit
+ * tests' coverage of its internal logic.
+ */
+dsTest.describe('Incident-management actions (real server)', () => {
+  dsTest('transitionCase rejects an invalid enum value and a no-op, end to end', async ({ users }) => {
+    const [analyst] = await users(1)
+    const title = `__test-${Date.now()}__ transitionCase integration`
+
+    await analyst.page.goto('/dashboard')
+    await analyst.page.getByTestId('filter-flagged-only').click()
+    await dsExpect(analyst.page.getByTestId('event-row').first()).toBeVisible({ timeout: 15_000 })
+    await analyst.page.getByTestId('event-row-select').first().click()
+    await analyst.page.getByTestId('open-case-from-selection').click()
+    await analyst.page.getByTestId('case-title-input').fill(title)
+    await analyst.page.getByTestId('create-case-submit').click()
+    await dsExpect(analyst.page).toHaveURL(/\/cases\/.+/, { timeout: 15_000 })
+    const caseId = analyst.page.url().split('/cases/')[1]
+
+    try {
+      const invalid = await analyst.page.evaluate(
+        async ({ caseId }) => {
+          const tokenRes = await fetch('/api/auth/token', { method: 'POST' })
+          const { token } = (await tokenRes.json()) as { token: string }
+          const res = await fetch('/api/actions/transitionCase', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ caseId, field: 'status', value: 'bogus_status' }),
+          })
+          return res.json()
+        },
+        { caseId },
+      )
+      dsExpect((invalid as { success: boolean }).success).toBe(false)
+      dsExpect((invalid as { error: string }).error).toContain('Invalid value')
+
+      // A genuine, valid transition first...
+      const first = await analyst.page.evaluate(
+        async ({ caseId }) => {
+          const tokenRes = await fetch('/api/auth/token', { method: 'POST' })
+          const { token } = (await tokenRes.json()) as { token: string }
+          const res = await fetch('/api/actions/transitionCase', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ caseId, field: 'priority', value: 'high' }),
+          })
+          return res.json()
+        },
+        { caseId },
+      )
+      dsExpect((first as { success: boolean }).success).toBe(true)
+      dsExpect((first as { data: { activityRecorded: boolean } }).data.activityRecorded).toBe(true)
+
+      // ...then the identical transition again, which must be rejected as a no-op.
+      const noop = await analyst.page.evaluate(
+        async ({ caseId }) => {
+          const tokenRes = await fetch('/api/auth/token', { method: 'POST' })
+          const { token } = (await tokenRes.json()) as { token: string }
+          const res = await fetch('/api/actions/transitionCase', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ caseId, field: 'priority', value: 'high' }),
+          })
+          return res.json()
+        },
+        { caseId },
+      )
+      dsExpect((noop as { success: boolean }).success).toBe(false)
+      dsExpect((noop as { error: string }).error).toContain('No change')
+    } finally {
+      await analyst.page.goto(`/cases/${caseId}`).catch(() => {})
+      await analyst.page.getByTestId('case-status-select').waitFor({ state: 'visible', timeout: 10_000 }).catch(() => {})
+      const deleteButton = analyst.page.getByRole('button', { name: 'Delete case' })
+      if (await deleteButton.count()) {
+        await deleteButton.click()
+        await analyst.page.getByRole('button', { name: 'Delete', exact: true }).click()
+      }
+    }
+  })
+
+  dsTest('confirmIncident sets a server timestamp and refuses a second confirmation', async ({ users }) => {
+    const [analyst] = await users(1)
+    const title = `__test-${Date.now()}__ confirmIncident integration`
+
+    await analyst.page.goto('/dashboard')
+    await analyst.page.getByTestId('filter-flagged-only').click()
+    await dsExpect(analyst.page.getByTestId('event-row').first()).toBeVisible({ timeout: 15_000 })
+    await analyst.page.getByTestId('event-row-select').first().click()
+    await analyst.page.getByTestId('open-case-from-selection').click()
+    await analyst.page.getByTestId('case-title-input').fill(title)
+    await analyst.page.getByTestId('create-case-submit').click()
+    await dsExpect(analyst.page).toHaveURL(/\/cases\/.+/, { timeout: 15_000 })
+    const caseId = analyst.page.url().split('/cases/')[1]
+
+    try {
+      const before = Date.now()
+      const first = await analyst.page.evaluate(
+        async ({ caseId }) => {
+          const tokenRes = await fetch('/api/auth/token', { method: 'POST' })
+          const { token } = (await tokenRes.json()) as { token: string }
+          const res = await fetch('/api/actions/confirmIncident', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ caseId }),
+          })
+          return res.json()
+        },
+        { caseId },
+      )
+      const after = Date.now()
+      dsExpect((first as { success: boolean }).success).toBe(true)
+      const data = (first as { data: { confirmedIncidentAt: string; activityRecorded: boolean } }).data
+      const ts = new Date(data.confirmedIncidentAt).getTime()
+      dsExpect(ts).toBeGreaterThanOrEqual(before - 2000)
+      dsExpect(ts).toBeLessThanOrEqual(after + 2000)
+      dsExpect(data.activityRecorded).toBe(true)
+
+      const second = await analyst.page.evaluate(
+        async ({ caseId }) => {
+          const tokenRes = await fetch('/api/auth/token', { method: 'POST' })
+          const { token } = (await tokenRes.json()) as { token: string }
+          const res = await fetch('/api/actions/confirmIncident', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ caseId }),
+          })
+          return res.json()
+        },
+        { caseId },
+      )
+      dsExpect((second as { success: boolean }).success).toBe(false)
+      dsExpect((second as { error: string }).error).toContain('already confirmed')
+    } finally {
+      await analyst.page.goto(`/cases/${caseId}`).catch(() => {})
+      await analyst.page.getByTestId('case-status-select').waitFor({ state: 'visible', timeout: 10_000 }).catch(() => {})
+      const deleteButton = analyst.page.getByRole('button', { name: 'Delete case' })
+      if (await deleteButton.count()) {
+        await deleteButton.click()
+        await analyst.page.getByRole('button', { name: 'Delete', exact: true }).click()
       }
     }
   })

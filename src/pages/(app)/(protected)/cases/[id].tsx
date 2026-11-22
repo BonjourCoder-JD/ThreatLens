@@ -1,15 +1,19 @@
 /**
  * Case detail — status/priority/assignment, linked events with their
- * detection explanations, and a chronological note thread. Every write
- * here (`put` on `cases`, `create` on `caseNotes`) is a plain client
- * mutation, not a server action: the `cases`/`caseNotes` schemas already
- * grant `member` the needed permissions (Day 1), so there's no RBAC to
- * bypass and no multi-collection orchestration beyond what
- * `createCaseFromEvents` already did at creation time. `useQuery`'s
- * WebSocket subscription is what makes every edit here appear for every
- * other connected analyst without a refresh — see
- * docs/CODE_WALKTHROUGH.md ("Case investigation workflow") for the full
- * data-flow explanation.
+ * detection explanations, and a chronological note thread.
+ *
+ * Status/priority/assignedTo changes go through the `transitionCase`
+ * server action, NOT a direct `useMutations.put` — this is the
+ * incident-management extension's actual security boundary.
+ * `src/schemas/cases-schema.ts`'s `member.writableFields` now excludes
+ * these fields, so a direct client write to any of them is rejected by
+ * the Durable Object itself; `transitionCase` is the only path that can
+ * still change them, specifically because it goes through the
+ * RBAC-bypassing `X-App-Action` mechanism and records an activity entry
+ * for every change. `summary` and notes remain plain client mutations —
+ * nothing about THEM needed to become server-mediated. See
+ * docs/ARCHITECTURE.md ("Incident-management extension") for the full
+ * rationale and docs/CODE_WALKTHROUGH.md for the data flow.
  */
 
 import { useState } from 'react'
@@ -30,6 +34,7 @@ import {
   useToast,
 } from '@/components/ui'
 import { EventReasons } from '@/components/EventReasons'
+import { callAction } from '@/lib/call-action'
 
 interface CaseRecord {
   title: string
@@ -85,7 +90,6 @@ export default function CaseDetailPage() {
 
   const { users } = useUsers()
   const { getName } = useUserLookup()
-  const { put } = useMutations<CaseRecord>('cases')
   const { removeConfirmed } = useMutations<CaseRecord>('cases')
   const { createConfirmed } = useMutations<NoteRecord>('caseNotes')
 
@@ -93,6 +97,21 @@ export default function CaseDetailPage() {
   const [submittingNote, setSubmittingNote] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
+
+  async function handleTransition(field: 'status' | 'severity' | 'priority' | 'assignedTo', value: string) {
+    const result = await callAction('transitionCase', { caseId: id, field, value })
+    if (!result.success) {
+      toastError(`Could not change ${field}`, result.error)
+      return
+    }
+    const data = result.data as { activityRecorded: boolean }
+    if (!data.activityRecorded) {
+      // The change itself succeeded — only the activity-log write failed.
+      // Non-atomic by design (see src/actions/case-actions.ts); surfaced
+      // honestly rather than silently dropped.
+      toastError('Change saved, but the activity record failed to save', 'See the Activity tab for a possible gap.')
+    }
+  }
 
   if (casesStatus === 'loading') {
     return <div className="flex h-64 items-center justify-center text-muted-foreground">Loading case…</div>
@@ -160,7 +179,7 @@ export default function CaseDetailPage() {
         <div className="mb-6 grid grid-cols-1 gap-4 rounded-xl border border-border bg-card p-5 shadow-[0_1px_3px_0_rgba(23,37,84,0.08)] sm:grid-cols-3">
           <div>
             <Label className="mb-1 block text-xs text-muted-foreground">Status</Label>
-            <Select value={theCase.data.status} onValueChange={(v) => void put(id!, { status: v })}>
+            <Select value={theCase.data.status} onValueChange={(v) => void handleTransition('status', v)}>
               <SelectTrigger data-testid="case-status-select">
                 <SelectValue />
               </SelectTrigger>
@@ -175,7 +194,7 @@ export default function CaseDetailPage() {
           </div>
           <div>
             <Label className="mb-1 block text-xs text-muted-foreground">Priority</Label>
-            <Select value={theCase.data.priority} onValueChange={(v) => void put(id!, { priority: v })}>
+            <Select value={theCase.data.priority} onValueChange={(v) => void handleTransition('priority', v)}>
               <SelectTrigger data-testid="case-priority-select">
                 <SelectValue />
               </SelectTrigger>
@@ -192,7 +211,7 @@ export default function CaseDetailPage() {
             <Label className="mb-1 block text-xs text-muted-foreground">Assigned to</Label>
             <Select
               value={theCase.data.assignedTo || 'unassigned'}
-              onValueChange={(v) => void put(id!, { assignedTo: v === 'unassigned' ? '' : v })}
+              onValueChange={(v) => void handleTransition('assignedTo', v === 'unassigned' ? '' : v)}
             >
               <SelectTrigger data-testid="case-assignee-select">
                 <SelectValue />
