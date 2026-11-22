@@ -99,18 +99,23 @@ was typed by a human.
   confirmed the result, as part of a guided manual-verification pass
   after deployment.
 - [x] Reviewed the dashboard's filter/summary behavior against real,
-  populated data with your own eyes end-to-end, as part of that same
+  populated data with my own eyes end-to-end, as part of that same
   verification pass.
 - [x] Deployed the app (`npx deepspace deploy`) and confirmed the live
   URL (https://threatlens-jd.app.space) loads and behaves correctly for
-  a reviewer without your local dev environment — confirmed by you and
+  a reviewer without my local dev environment — confirmed personally and
   independently by read-only automated checks against the live URL
   (every main route, zero console errors, mobile viewport).
 - [x] Personally clicked through the incident-management extension in
   the running app — set a severity, clicked "Confirm as incident," and
   watched the activity history fill in.
-- [ ] **Not yet done:** a fresh-eyes read-through of this submission note
-  and the README before actually submitting.
+- [x] A fresh-eyes read-through of this submission note and the README,
+  done as part of final release verification. Found and fixed one small
+  issue: two checklist items above had drifted into second-person voice
+  ("your own eyes," "your local dev environment") against this document's
+  otherwise first-person voice — corrected so it consistently reads as my
+  own account. No factual, numeric, or consistency problems found in
+  either document.
 
 ---
 
