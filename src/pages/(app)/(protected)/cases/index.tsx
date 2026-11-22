@@ -41,7 +41,7 @@ const PRIORITY_BADGE: Record<string, 'secondary' | 'warning' | 'destructive'> = 
 }
 
 export default function CasesListPage() {
-  const { records, status } = useQuery<CaseRecord>('cases', { limit: 500 })
+  const { records, status, error: queryError } = useQuery<CaseRecord>('cases', { limit: 500 })
   const { getName } = useUserLookup()
   const [statusFilter, setStatusFilter] = useState<string>('all')
 
@@ -52,6 +52,19 @@ export default function CasesListPage() {
 
   if (status === 'loading') {
     return <div className="flex h-64 items-center justify-center text-muted-foreground">Loading cases…</div>
+  }
+
+  if (status === 'error') {
+    return (
+      <div className="min-h-full text-foreground">
+        <div className="mx-auto max-w-2xl px-6 py-20">
+          <EmptyState
+            title="Could not load cases"
+            description={queryError ?? 'Something went wrong talking to the server. Try reloading the page.'}
+          />
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -89,7 +102,7 @@ export default function CasesListPage() {
         ) : filtered.length === 0 ? (
           <EmptyState title="No cases match this filter" description="Try a different status." />
         ) : (
-          <div className="overflow-hidden rounded-xl border border-border bg-card shadow-[0_1px_3px_0_rgba(23,37,84,0.08)]" data-testid="cases-list">
+          <div className="overflow-x-auto rounded-xl border border-border bg-card shadow-[0_1px_3px_0_rgba(23,37,84,0.08)]" data-testid="cases-list">
             <table className="w-full text-left text-sm">
               <thead className="bg-muted/60 text-xs text-muted-foreground">
                 <tr>

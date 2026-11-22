@@ -66,7 +66,7 @@ function scoreBadgeVariant(score: number): 'secondary' | 'warning' | 'destructiv
 }
 
 export default function DashboardPage() {
-  const { records, status } = useQuery<AuthEventRecord>('authEvents', {
+  const { records, status, error: queryError } = useQuery<AuthEventRecord>('authEvents', {
     limit: 2000,
     orderBy: 'timestamp',
     orderDir: 'desc',
@@ -160,6 +160,19 @@ export default function DashboardPage() {
 
   if (status === 'loading') {
     return <div className="flex h-64 items-center justify-center text-muted-foreground">Loading events…</div>
+  }
+
+  if (status === 'error') {
+    return (
+      <div className="min-h-full text-foreground">
+        <div className="mx-auto max-w-2xl px-6 py-20">
+          <EmptyState
+            title="Could not load events"
+            description={queryError ?? 'Something went wrong talking to the server. Try reloading the page.'}
+          />
+        </div>
+      </div>
+    )
   }
 
   if (records.length === 0) {

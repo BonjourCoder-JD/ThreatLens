@@ -25,19 +25,27 @@ export function CreateCaseModal({ eventIds, onClose }: { eventIds: string[]; onC
       return
     }
     setSubmitting(true)
-    const result = await callAction<{ caseId: string }>('createCaseFromEvents', {
-      title: title.trim(),
-      summary: summary.trim(),
-      eventIds,
-    })
-    setSubmitting(false)
-    if (!result.success) {
-      setError(result.error)
-      return
+    try {
+      const result = await callAction<{ caseId: string }>('createCaseFromEvents', {
+        title: title.trim(),
+        summary: summary.trim(),
+        eventIds,
+      })
+      if (!result.success) {
+        setError(result.error)
+        return
+      }
+      toastSuccess('Case opened', `Linked ${eventIds.length} event${eventIds.length === 1 ? '' : 's'}.`)
+      onClose()
+      navigate(`/cases/${result.data.caseId}`)
+    } catch (e) {
+      // callAction's own fetch/JSON-parse can throw (offline, a non-JSON
+      // error page) before it ever returns a { success, error } result —
+      // without this, the button would spin forever with no feedback.
+      setError(e instanceof Error ? e.message : 'Could not reach the server. Check your connection and try again.')
+    } finally {
+      setSubmitting(false)
     }
-    toastSuccess('Case opened', `Linked ${eventIds.length} event${eventIds.length === 1 ? '' : 's'}.`)
-    onClose()
-    navigate(`/cases/${result.data.caseId}`)
   }
 
   return (

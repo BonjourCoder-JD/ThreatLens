@@ -156,17 +156,25 @@ export default function CaseDetailPage() {
   const [confirmingIncident, setConfirmingIncident] = useState(false)
 
   async function handleTransition(field: 'status' | 'severity' | 'priority' | 'assignedTo', value: string) {
-    const result = await callAction('transitionCase', { caseId: id, field, value })
-    if (!result.success) {
-      toastError(`Could not change ${field}`, result.error)
-      return
-    }
-    const data = result.data as { activityRecorded: boolean }
-    if (!data.activityRecorded) {
-      // The change itself succeeded — only the activity-log write failed.
-      // Non-atomic by design (see src/actions/case-actions.ts); surfaced
-      // honestly rather than silently dropped.
-      toastError('Change saved, but the activity record failed to save', 'See the Activity tab for a possible gap.')
+    try {
+      const result = await callAction('transitionCase', { caseId: id, field, value })
+      if (!result.success) {
+        toastError(`Could not change ${field}`, result.error)
+        return
+      }
+      const data = result.data as { activityRecorded: boolean }
+      if (!data.activityRecorded) {
+        // The change itself succeeded — only the activity-log write failed.
+        // Non-atomic by design (see src/actions/case-actions.ts); surfaced
+        // honestly rather than silently dropped.
+        toastError('Change saved, but the activity record failed to save', 'See the Activity tab for a possible gap.')
+      }
+    } catch (e) {
+      // callAction's own fetch/JSON-parse can throw before it ever returns
+      // a { success, error } result (offline, a non-JSON error page) —
+      // without this, the select would silently fail to update with no
+      // indication anything went wrong.
+      toastError(`Could not change ${field}`, e instanceof Error ? e.message : 'Could not reach the server.')
     }
   }
 
@@ -185,6 +193,8 @@ export default function CaseDetailPage() {
         // Confirmation itself succeeded — only the activity-log write failed.
         toastError('Confirmed, but the activity record failed to save', 'See the Activity history below for a possible gap.')
       }
+    } catch (e) {
+      toastError('Could not confirm incident', e instanceof Error ? e.message : 'Could not reach the server.')
     } finally {
       setConfirmingIncident(false)
     }
