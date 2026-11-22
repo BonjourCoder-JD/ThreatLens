@@ -32,8 +32,9 @@ disagree.
 
 ![Event detail](docs/screenshots/event-detail.png)
 
-**Case investigation** — status, priority, assignment, linked events with
-their detection explanations, and a note thread, all synced live between
+**Case investigation** — status, severity, priority, assignment, incident
+confirmation, linked events with their detection explanations, a note
+thread, and a read-only activity history, all synced live between
 analysts.
 
 ![Case detail](docs/screenshots/case-detail.png)
@@ -64,6 +65,15 @@ is mocked or illustrative.*
   flagged events, track status/priority/assignment, add notes, all synced
   in real time between analysts (verified with two independent signed-in
   browser sessions, not mocked).
+- **Incident-management extension** — severity, a one-way "confirm as
+  incident" step with a server-generated timestamp, and a server-attributed
+  activity history. Protected fields (`status`/`severity`/`priority`/
+  `assignedTo`/`confirmedIncidentAt`) can only change through two server
+  actions — proven server-side, not just hidden in the UI, with a direct
+  raw-WebSocket test. The activity log is honestly documented as
+  best-effort, not transactional: `docs/ARCHITECTURE.md`'s "Audit
+  consistency" section explains why, and a real induced-failure test backs
+  it up.
 - **Admin console** — data import, detection recompute, and ML-score
   import, each a background job, each gated to the `admin` role at the
   Durable Object level.
@@ -81,9 +91,9 @@ flowchart TB
 
     subgraph worker["Cloudflare Worker — DeepSpace app"]
         Auth[DeepSpace Auth<br/>sign-in, JWT verification]
-        RecordRoom[(RecordRoom<br/>authEvents / cases / caseNotes / users)]
+        RecordRoom[(RecordRoom<br/>authEvents / cases / caseNotes / caseActivity / users)]
         JobRoom[JobRoom<br/>background jobs]
-        Actions[Server Actions<br/>createCaseFromEvents]
+        Actions[Server Actions<br/>createCaseFromEvents, transitionCase, confirmIncident]
         StatDetector[Statistical Detector<br/>src/lib/anomaly-detection.ts]
     end
 
@@ -133,9 +143,9 @@ app. Full design rationale in
 ## DeepSpace capabilities used
 
 - **Authentication** — `DeepSpaceAuthProvider`, `<AuthGate>`, `useAuth` (Google/GitHub sign-in, no custom auth code).
-- **RecordRoom** — four collections (`users`, `authEvents`, `cases`, `caseNotes`) with per-role, per-operation permissions enforced in the Durable Object.
+- **RecordRoom** — five collections (`users`, `authEvents`, `cases`, `caseNotes`, `caseActivity`) with per-role, per-operation AND per-field permissions enforced in the Durable Object (`cases`' `writableFields` locks protected fields to server-action-only writes).
 - **JobRoom (background jobs)** — four admin-gated jobs: synthetic-data import, statistical-score recompute, ML-score import, each idempotent.
-- **Server actions** — one (`createCaseFromEvents`), used specifically because it's genuine multi-collection orchestration, not a blanket wrapper around every write.
+- **Server actions** — `createCaseFromEvents` (multi-collection orchestration at creation), and `transitionCase`/`confirmIncident` (the incident-management extension's only path for changing a protected case field, each pairing the change with a server-attributed activity record).
 - **Real-time sync** — `useQuery`/`useMutations`, the mechanism behind every live update in the app; no polling or manual refresh anywhere.
 - **User roster** — `useUsers()`/`useUserLookup()` for case assignment and note attribution.
 - **Theming** — a real DeepSpace theme (`src/themes.css`), not hardcoded component colors.
@@ -176,9 +186,15 @@ npm run build                              # production build
 ```
 
 The Playwright suite includes real, non-mocked verification: two
-independent signed-in browser sessions proving real-time case sync, and
-direct raw-WebSocket attempts proving admin-only and ownership RBAC are
-enforced server-side, not just hidden in the UI.
+independent signed-in browser sessions proving real-time case, severity,
+incident-confirmation, and activity-history sync (with the non-owner
+analyst doing the confirming, to also prove it isn't creator-restricted),
+and direct raw-WebSocket attempts proving admin-only, ownership, and
+protected-case-field RBAC are all enforced server-side, not just hidden in
+the UI. `npm run test:unit` also covers the incident-management server
+actions' internal logic against a fake `ActionTools`, including two
+genuinely induced "primary write succeeds, activity write fails" partial-
+failure scenarios.
 
 ## Deployment
 
@@ -222,7 +238,16 @@ injection rate rather than discovered independently.
 - One pre-existing scaffold test (`src/prerender-entry.test.tsx`) fails
   for reasons unrelated to this project's code — documented in
   [`docs/DEBUGGING_LOG.md`](docs/DEBUGGING_LOG.md) rather than silently
-  worked around.
+  worked around, and re-confirmed (via `git diff`, not assumption) to
+  still predate every change in the incident-management extension.
+- The incident-management extension's `caseActivity` log is best-effort,
+  not transactional: RecordRoom has no cross-collection transaction
+  primitive, so a case's protected-field write can, rarely, succeed while
+  its paired activity write fails. Surfaced honestly (`activityRecorded:
+  false`) and tested with a real induced failure, not hidden — see
+  `docs/ARCHITECTURE.md`'s "Audit consistency." A reconciliation job to
+  detect/backfill a dropped activity record was deliberately not built in
+  this extension's 2-day scope — a named, open piece of further work.
 - Optional, not-yet-built: CSV export of filtered events, additional
   chart types — intentionally out of scope for this submission.
 

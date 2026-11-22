@@ -1,6 +1,6 @@
 # ThreatLens — Architecture
 
-Living document. Updated at the end of each build day. Last updated: **P0 roadmap Phase 4 (README + architecture diagram) — all five required P0 items complete**.
+Living document. Updated at the end of each build day. Last updated: **Incident-management extension, Day 2 (UI + full documentation) — see "Incident-management extension" below**.
 
 ## Submission roadmap (tracked — updated after every phase)
 
@@ -20,7 +20,11 @@ and substantial; #4 needed the finished UI for screenshots, so it ran last.
 **All five required (P0) roadmap items are now complete.** Optional
 stretch items (CSV export, additional charts) remain explicitly out of
 scope unless separately approved — see `README.md`'s "Known limitations &
-possible future work."
+possible future work." A separate, explicitly-approved **incident-management
+extension** (severity, incident confirmation, a server-attributed activity
+history) was built afterward as its own 2-day, scope-limited effort — see
+"Incident-management extension" below; it does not change this table's
+P0 status.
 
 See `docs/DEBUGGING_LOG.md` for what was actually verified at each step —
 this table tracks scope, not proof; don't treat "Done" here as a
@@ -56,11 +60,16 @@ live):
    client-side" pattern as the dashboard) and renders status/priority/
    assignment controls, the linked events (resolved against `authEvents`
    the same way), and the note thread.
-5. Status/priority/assignment edits are **plain client mutations**
-   (`useMutations('cases').put(...)`) — no server action needed, because
-   the `cases` schema already grants `member: update: true` directly.
-   Notes use `createConfirmed` so a rejection surfaces as a real error, not
-   a silent no-op.
+5. Status/priority/assignment edits were, at this phase, **plain client
+   mutations** (`useMutations('cases').put(...)`) — no server action
+   needed, because the `cases` schema granted `member: update: true`
+   directly on every field. **The incident-management extension (below)
+   changed this**: those fields (plus the new `severity`) now go through
+   the `transitionCase` server action instead, specifically so every
+   change produces an attributed `caseActivity` record — see "Incident-
+   management extension" for why and how. Notes and `summary` still use
+   plain client mutations (`createConfirmed`/`put`) exactly as before;
+   they never needed that pairing.
 
 **How real-time sync actually works here.** Every page on this workflow
 uses `useQuery`, which — per `docs/concepts/realtime-sync` — opens one
@@ -460,6 +469,147 @@ dataset — **not** a measure of real-world detection accuracy; the full
 report's limitations section is the authoritative statement of what these
 numbers do and don't mean.
 
+## Incident-management extension (Day 1–2, post-submission-readiness)
+
+A separate, explicitly time-boxed (2-day max) enhancement built *after* all
+five P0 roadmap items above were already complete, evolving the existing
+`cases` workflow toward a lightweight incident-management lifecycle:
+anomaly → case → confirmed incident → assigned response → resolution →
+activity history. Approved with a detailed GO/NO-GO analysis beforehand
+(investigating the existing schema/actions/permissions, assessing whether
+to extend `cases` or add a new entity, and estimating migration/consistency
+risk) — this section documents what that analysis led to and how it was
+actually built.
+
+**Why extend `cases`, not add a new `incidents` entity.** A "confirmed
+incident" is not a different kind of object — it's a `cases` row that has
+crossed a threshold (an analyst decided it's real), with two more facts
+attached: how severe it is, and when that decision happened. Modeling it as
+a separate entity would mean duplicating `title`/`summary`/`relatedEventIds`/
+notes/activity-linkage, plus a migration step moving rows between two
+tables as a case gets confirmed — real complexity for no behavioral gain in
+an app this size. Two additive columns on `cases` (`severity`,
+`confirmedIncidentAt`) and one new child collection (`caseActivity`) deliver
+the same lifecycle with zero migration risk: DeepSpace's documented
+"add a column without losing data" pattern means every existing `cases` row
+remains valid with no backfill step.
+
+**Data model (additive only — see `src/schemas/cases-schema.ts` and
+`src/schemas/case-activity-schema.ts`):**
+
+| Column | Collection | Notes |
+|---|---|---|
+| `severity` | `cases` | `low`/`medium`/`high`/`critical`, no default — absent until an analyst sets it |
+| `confirmedIncidentAt` | `cases` | ISO timestamp string, absent until confirmed; **always server-generated**, never accepted from the client |
+| `caseActivity` (new collection) | — | `caseId` (reference), `eventType` (one of the five transition types), `fromValue`, `toValue` |
+
+**The actual security boundary: field-level `writableFields`, not a
+convention.** Before this extension, any `member` could `useMutations
+('cases').put(id, { status: 'resolved' })` directly — fine when status was
+just a workflow label, not fine once a status/severity/priority/assignment
+change is supposed to always produce an attributed activity record.
+`cases`' `member` permissions block now sets `writableFields: ['title',
+'summary', 'relatedEventIds']` — an explicit allowlist. A client write that
+touches any field outside that list (`status`, `severity`, `priority`,
+`assignedTo`, `confirmedIncidentAt`) is rejected **by the Durable Object
+itself** (`checkFieldPermissions` in the compiled worker, returning `FIELD
+ERROR: Role 'member' cannot modify field 'status'`), before the write ever
+reaches storage. This is proven, not assumed: `tests/api.spec.ts`'s
+"Protected case fields" suite opens a raw WebSocket (bypassing the UI and
+every action) and sends the exact `core.put` message `useMutations.put`
+would send — one test proves `status` is rejected and the value is
+unchanged on reload, a second proves `summary` is still directly writable,
+so the lockdown is demonstrably field-specific, not a blanket "cases are
+now read-only" regression.
+
+**The only path left for a protected field: two server actions.**
+`transitionCase` (one protected field, one new value) and `confirmIncident`
+(the one-way incident-confirmation step) live in
+`src/actions/case-actions.ts` and reach the Durable Object through the
+`X-App-Action` RBAC-bypass mechanism — the same documented escalation path
+every other action/job in this app already uses, not a new loophole:
+
+- `transitionCase` validates the field is one of `status`/`severity`/
+  `priority`/`assignedTo`, validates the new value against that field's
+  enum (or that an `assignedTo` user id actually exists), rejects a
+  no-op (the value already equals the target — this both keeps the
+  activity log free of meaningless noise and, as a deliberate side
+  effect, closes off the one obvious "just resend it" recovery path — see
+  Audit consistency below), writes the case, then writes one
+  `caseActivity` row describing the change.
+- `confirmIncident` rejects a case that's already confirmed, generates
+  `confirmedAt` with `new Date().toISOString()` **inside the action** —
+  there is no `confirmedAt` parameter the client can even supply a value
+  for, which is the actual (and only) answer to "how do you stop a client
+  from backdating an incident confirmation": the field simply isn't on the
+  trust boundary. Verified in `src/actions/case-actions.test.ts` by passing
+  a 2020 date in `params` and asserting the real timestamp wins anyway.
+- Actor attribution for every `caseActivity` row comes from
+  `tools.create`'s own `createdBy`, set from the verified caller's JWT
+  subject — there is no actor field on the schema a client could set, so
+  there's nothing to lie about.
+- Neither action is restricted to the case's creator or to `admin` — same
+  shared-team-workspace model Day 1 chose for `status`/`priority`/
+  `assignedTo` edits generally. Verified in `tests/collab.spec.ts`: the
+  non-owner analyst (B, who did not create the case) is the one who
+  changes severity and confirms the incident, and the owner (A) sees both
+  take effect live.
+
+**Audit consistency — read this before assuming the activity log is
+complete.** RecordRoom has no multi-collection transaction primitive.
+Every transition here does its two writes in a fixed order (case field,
+then `caseActivity`) and returns `activityRecorded: boolean` alongside
+`success: true` for the case where the primary write succeeded but the
+activity write didn't. **This is deliberately never advertised as atomic,
+and `caseActivity` is accurately documented as best-effort, not
+guaranteed-complete.** This isn't a theoretical caveat — `src/actions/
+case-actions.test.ts` injects a fake `tools` where `update` succeeds and
+`create` fails, for both actions, and asserts the real code path returns
+`success: true, activityRecorded: false` rather than throwing or silently
+reporting full success. A further test documents, on purpose, that a naive
+"just retry the same call" cannot recover a dropped activity record: once
+the case has already moved to the new value, resubmitting the identical
+transition is rejected by the no-op guard, exactly like any other no-op.
+**A reliable reconciliation mechanism (e.g. a scheduled job diffing `cases`
+against `caseActivity` for gaps) was deliberately not built** — it's real,
+identifiable further work, named here and in `README.md`'s limitations
+rather than quietly left unmentioned or falsely claimed solved.
+
+**UI (Day 2): `src/pages/(app)/(protected)/cases/[id].tsx`.** A severity
+selector and a status/priority/assignee selector sit in the same grid, all
+four routed through `transitionCase`; a "Confirm as incident" button (only
+shown while unconfirmed) calls `confirmIncident` and is replaced by a
+"Confirmed incident" badge plus the confirmation timestamp once it
+succeeds; a read-only activity history section below the notes thread lists
+every `caseActivity` row as a plain sentence (actor, timestamp, what
+changed, from what, to what), with explicit loading/empty/error states and
+a visible caption restating the best-effort consistency guarantee so the
+UI itself never overstates what the log promises. All of it is an ordinary
+`useQuery('caseActivity', { where: { caseId } })` — the same real-time
+mechanism as every other query on this page, so a second analyst's
+transition appears in the first analyst's open activity history without a
+refresh. Verified live (not just via API) in `tests/collab.spec.ts`.
+
+**Design decisions worth being able to defend:**
+- Why `caseActivity` is schema-level `create: false` for *every* role
+  including `admin`, rather than just leaving it off the client
+  `writableFields` allowlist like `cases`' protected fields: an activity
+  row has no legitimate direct-client write path at all, in either
+  direction, so the strongest available guarantee (the Durable Object
+  refuses it outright, for anyone, full stop) costs nothing to apply.
+- Why `transitionCase` takes a generic `{ field, value }` rather than four
+  separate actions (`changeStatus`, `changeSeverity`, …): the four fields
+  share identical validate → no-op-check → update → record-activity
+  shape; one action with a small enum dispatch avoids copy-pasted logic
+  across four handlers for a difference that's really just "which column."
+- Why the no-op guard isn't relaxed to "allow a retry if the activity
+  write failed last time": that would require either storing extra
+  state to detect "this looks like a recovery attempt" (more surface
+  area, more to get subtly wrong) or trusting the client's claim that
+  the previous attempt's activity write failed (a client could use the
+  same claim to force redundant activity rows). Leaving it as a known,
+  documented gap was the more honest trade for a 2-day scope.
+
 ## Known risks / limitations (living list)
 
 - **Worker bundle size.** The committed dataset JSON is bundled into the
@@ -479,3 +629,10 @@ numbers do and don't mean.
   unrelated test (`src/prerender-entry.test.tsx`) now fails for a genuine
   reason (likely two React instances under `vmThreads`) that was previously
   masked — left open, not silently patched over.
+- **`caseActivity` is best-effort, not transactional.** RecordRoom has no
+  cross-collection transaction primitive, so a case's protected-field write
+  can (rarely) succeed while its paired activity write fails. Surfaced
+  honestly to the UI (`activityRecorded: false`) and tested for real via
+  injected failures, not hidden — see "Incident-management extension"
+  above. A reliable reconciliation job was deliberately not built in this
+  2-day scope and remains a named, open piece of further work.

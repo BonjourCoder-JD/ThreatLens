@@ -487,6 +487,112 @@ difference is the exercise). Specifically:
   choice in this project: not "it seemed easier" but a specific tradeoff
   named out loud.
 
+## Incident-management extension: the things you were asked to be able to explain
+
+Built after the five required P0 items, as a separate, explicitly
+2-day-scoped enhancement. The rubric categories below are the ones this
+extension was specifically asked to cover: server-side authorization,
+non-atomic writes, idempotency, state transitions, activity history, data
+modeling, and real-time synchronization. Full reasoning in
+`docs/ARCHITECTURE.md`'s "Incident-management extension" section and the
+file-level walkthrough in `docs/CODE_WALKTHROUGH.md`'s matching "Feature"
+section — this section is the compressed, interview-ready version.
+
+**1. Data modeling — why extend `cases` instead of a new `incidents`
+entity.** A confirmed incident is a `cases` row that crossed a threshold
+(an analyst decided it's real), not a different kind of object. Two
+additive columns (`severity`, `confirmedIncidentAt`) plus one new child
+collection (`caseActivity`) got the same lifecycle as a separate entity
+would, with zero migration risk — every existing row stays valid with no
+backfill, which is DeepSpace's documented pattern for adding a column.
+
+**2. State transitions — `transitionCase`'s shape.** One generic action,
+not four, because `status`/`severity`/`priority`/`assignedTo` share the
+identical validate → no-op-check → update → record-activity shape; only
+the allowed values differ, which is a dispatch-table difference, not a
+reason for four near-identical functions. The no-op guard (reject a
+transition whose target value already matches the current one) does two
+jobs at once: it keeps the activity log free of meaningless noise, and it
+closes off the one obvious "just resend it" recovery path if an activity
+write drops — see point 4.
+
+**3. Server-side authorization — the actual boundary, and how to prove
+it.** `cases`' `member.writableFields` now excludes every protected field,
+so a direct client write to `status` (or `severity`/`priority`/
+`assignedTo`/`confirmedIncidentAt`) is refused **by the Durable Object
+itself** — not by the UI declining to offer a button. Proven, not assumed:
+a raw-WebSocket test sends the literal `core.put` message the SDK would
+send, gets back `core.error` with `"cannot modify field 'status'"`, and a
+reload confirms the value genuinely didn't change. A second test sends the
+same shape of message for `summary` and confirms it IS accepted — proving
+the lockdown is field-specific, not a side effect of something else
+breaking.
+
+**4. Non-atomic writes — say this before being asked.** RecordRoom has no
+cross-collection transaction primitive. Every transition does two writes
+in a fixed order (the case field, then the `caseActivity` row) and returns
+`activityRecorded: false` alongside `success: true` for the case where the
+first write succeeded and the second didn't. This was genuinely induced in
+a test (a fake `tools` where `create` fails) and asserted to behave this
+way — not a theoretical disclaimer. A further test documents, on purpose,
+that resubmitting the identical transition to "recover" a dropped activity
+record is rejected by the same no-op guard from point 2 — a real,
+named limitation, not something quietly left for someone else to discover.
+A reconciliation job (diffing `cases` against `caseActivity` for gaps) was
+deliberately not built in this 2-day scope.
+
+**5. Idempotency — how this differs from Day 1's import idempotency.**
+Day 1's idempotency was "importing the same 1,000 events twice doesn't
+duplicate rows" (an upsert via `tools.create(..., recordId)`). This
+feature's idempotency is narrower and stricter: the SAME transition
+request submitted twice must have NO effect the second time, which is
+exactly the no-op guard — and it's also exactly what makes activity-record
+recovery-by-retry impossible (idempotency and recoverability pulled in
+opposite directions here, and idempotency won, deliberately).
+
+**6. Activity history — what it promises and what it explicitly doesn't.**
+A plain `useQuery('caseActivity', { where: { caseId } })`, live like every
+other query in the app — no polling, no refresh button. It is documented,
+in the code, in the UI caption, and here, as **best-effort, not
+guaranteed-complete or transactional**. Never describe it in an interview
+as a complete audit log; describe it as "a record of every change that
+was successfully recorded, with an honest, tested gap for the rare case
+where it wasn't."
+
+**7. Real-time synchronization — how you'd prove it live, not just
+describe it.** Open two signed-in sessions as two different analysts,
+neither the case's creator exclusively privileged over the other — have
+one (deliberately the NON-owner, to also prove authorization isn't
+creator-restricted) change severity and confirm the incident, and watch
+the other's already-open page update the severity select, the confirmed
+badge, the timestamp, and the activity history, with no reload. This is
+exactly what `tests/collab.spec.ts`'s extended two-analyst test does.
+
+### Coding exercises for this extension
+
+**1. Build the reconciliation job this extension deliberately doesn't
+have.** An admin-gated `JobRoom` job that diffs `cases` (every row with a
+non-default `status`, or a set `confirmedIncidentAt`) against
+`caseActivity` and reports — don't auto-repair — cases whose current
+field values have no activity entry explaining how they got there. Then
+think through (you don't have to build it): once a value has already
+changed, you no longer know what it changed *from* — how would a safe
+backfill even reconstruct that? This is the same wall `transitionCaseWith`
+runs into from the write side; your job hits it from the read side.
+
+**2. Add a sixth transitionable "field": a free-text resolution reason.**
+`cases` doesn't currently require a reason when a case moves to
+`resolved`/`false_positive`. Extend `transitionCase` so that transitioning
+`status` specifically to one of those two values requires a non-empty
+`reason` string in `params`, stores it as the `toValue` of a NEW
+`eventType` (`resolution_reason`) activity row **in addition to** the
+normal `status_change` row (two activity rows from one call — decide
+whether that's one `tools.create` call or two, and whether a failure on
+the second one should roll back anything, given there's no transaction
+primitive to roll back WITH). Write a test proving a case can't be
+resolved without a reason, and that reopening it later doesn't require one
+(the requirement is directional, not symmetric).
+
 ## Day 1 learning session (~20-25 min)
 
 Read this once, then close the laptop and try to explain it to someone
@@ -531,3 +637,46 @@ Open local dev (`npx deepspace dev start`), sign in with your real account,
 visit `/admin`, click "Import synthetic events," and watch it finish. Then
 look at the result in the job list. This closes the one honest gap from
 today's report — do it before Day 2 starts.
+
+## Incident-management extension — Day 2 learning session (~20-25 min)
+
+**1. What got built today, in one sentence each (5 min).**
+A severity selector and a "Confirm as incident" control on the case detail
+page, both routed through the server actions built on Day 1; a read-only
+activity-history section rendering every `caseActivity` row as a plain
+sentence with loading/empty/error states; and a two-analyst Playwright
+test extended to prove severity changes, incident confirmation, and the
+activity feed all sync live — with the non-owner analyst doing the
+confirming, to also prove it isn't creator-restricted.
+
+**2. The one idea that ties it together (5 min).**
+Day 1 built the lock (`writableFields`) and the only two keys that still
+fit it (`transitionCase`, `confirmIncident`). Day 2 is just giving analysts
+a way to actually turn those keys from the UI, and a way to see what's
+been turned — no new security decisions were made today, only UI wired
+onto yesterday's boundary. Practice saying that distinction out loud: "the
+hard decision was yesterday; today was wiring a button to it."
+
+**3. The thing that's easy to get wrong if you don't say it first (5
+min).** The activity history looks exactly like a normal audit log — a
+list of rows with a timestamp and who did it. It is NOT a guaranteed one.
+Say this before being asked: "RecordRoom can't write to two collections
+atomically, so this is best-effort, and I have a test that proves what
+happens on the rare drop." Saying it unprompted reads as engineering
+maturity; waiting to be caught reads as not having thought about it.
+
+**4. What's genuinely still open, and why that's fine to say (5 min).**
+No reconciliation job exists to detect or repair a dropped activity
+record — it was deliberately left as a coding exercise rather than built,
+because building it safely (see exercise 1 above) is a real design
+problem, not a quick addition, and this extension was explicitly scoped
+to 2 days.
+
+**5. One thing to go try yourself (5 min).**
+In local dev, open two browser profiles signed in as two different
+analysts. Have one confirm a case as an incident and set its severity;
+watch the other's already-open case page update both, live, with no
+reload. Then open the activity history and read the sentences out loud —
+if any of them don't read as a clear, specific description of what
+changed, that's worth fixing before you'd want to show this in an
+interview.

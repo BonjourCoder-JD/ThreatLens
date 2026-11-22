@@ -985,13 +985,19 @@ does it.
 ### Design decisions & tradeoffs
 
 - **One server action, not a blanket "wrap everything in actions"
-  policy.** Status/priority/assignment edits and note creation are plain
-  `useMutations` calls — the schema already permits them for `member`, and
-  wrapping a single-table write in a server action would add a network hop
-  and a second code path for zero benefit. The ONE place a server action
-  earns its keep is creation, because it genuinely orchestrates two
-  collections (case + its origin note) — see the action-routes.ts header
-  comment on when an action is actually warranted versus reflexive.
+  policy — as originally built.** Status/priority/assignment edits and
+  note creation were plain `useMutations` calls at the time this feature
+  shipped — the schema permitted them directly for `member`, and wrapping
+  a single-table write in a server action would have added a network hop
+  and a second code path for zero benefit. Creation was the one action,
+  because it genuinely orchestrates two collections (case + its origin
+  note). **This changed in the incident-management extension** (its own
+  "Feature" section below): `status`/`severity`/`priority`/`assignedTo`
+  gained a real reason to go through an action — pairing the write with an
+  attributed `caseActivity` record — so they moved off direct
+  `useMutations` onto `transitionCase`. Note creation and `summary` edits
+  stayed exactly as they were; they never needed that pairing. The
+  underlying judgment call didn't change, only which fields meet its bar.
 - **`EventReasons`/`RuleReference` extracted mid-phase, not written twice.**
   The case detail page needed the exact same "why was this flagged" UI the
   dashboard already had. Copy-pasting it would have meant two places to
@@ -1062,10 +1068,13 @@ does it.
   fields?"** → Deletion is destructive and irreversible; the other edits
   (status, priority, assignment, notes) are corrections a team can make to
   each other's work without real loss, and deliberately stay open to
-  support that. I'd revisit this if cases needed an audit trail of status
-  changes too — right now, overwriting `status` is also technically
-  "destructive" to the previous value, and the only place that history
-  survives is the notes thread if someone wrote one.
+  support that. I originally noted I'd revisit this if cases ever needed
+  an audit trail of status changes — the incident-management extension
+  (see its own "Feature" section below) is exactly that revisit:
+  `status`/`severity`/`priority`/`assignedTo` now go through
+  `transitionCase`, which records every change in `caseActivity`, so
+  overwriting `status` no longer silently loses the previous value the
+  way it did when this section was first written.
 
 ### Practice exercise
 
@@ -1233,6 +1242,217 @@ pytest scripts/ml
 
 Then re-check `docs/ML_EVALUATION_REPORT.md`'s numbers actually changed
 (or didn't, and you understand why).
+
+---
+
+## Feature: Incident-management extension (protected fields, incident confirmation, activity history)
+
+### What it does and why it exists
+
+Evolves the case workflow one step further: `status`/`severity`/
+`priority`/`assignedTo` changes now go through a server action instead of
+a direct client write, every change produces a server-attributed
+`caseActivity` row, and a case can be explicitly confirmed as a real
+security incident (a one-way, server-timestamped step). This is the piece
+that turns "a shared list of investigations" into something closer to a
+real incident-management lifecycle — anomaly → case → confirmed incident →
+tracked response — while staying inside the existing `cases` entity rather
+than standing up a second one. Built after a separate GO/NO-GO analysis
+(see `docs/ARCHITECTURE.md`'s "Incident-management extension" for the full
+reasoning); this section is the file-level walkthrough.
+
+### Files, functions, data structures
+
+- `src/schemas/cases-schema.ts` — `severity`, `confirmedIncidentAt` columns
+  (additive, no migration); `member.writableFields` now excludes every
+  protected field.
+- `src/schemas/case-activity-schema.ts` — the new `caseActivity`
+  collection; `create: false` for every role, including `admin`.
+- `src/actions/case-actions.ts` — `transitionCaseWith`/`transitionCase`
+  and `confirmIncidentWith`/`confirmIncident` (the dependency-injected
+  function and its thin `ActionHandler` wrapper, for each of the two new
+  actions). The `...With(tools, params)` functions are exported
+  separately from their `ActionHandler` wrappers specifically so tests can
+  inject a fake `tools` (see "Likely bugs" and the module's own header
+  comment on non-atomicity).
+- `src/actions/case-actions.test.ts` — unit tests against the fake
+  `tools`, including the two real induced partial-failure cases.
+- `src/pages/(app)/(protected)/cases/[id].tsx` — severity selector,
+  "Confirm as incident" button / confirmed badge, activity-history
+  section, and `handleTransition`/`handleConfirmIncident`, which replaced
+  the page's previous direct `useMutations('cases').put(...)` calls for
+  these fields.
+
+### Data flow
+
+1. An analyst changes the status/severity/priority/assignee select on the
+   case detail page. The `onValueChange` handler calls `handleTransition`,
+   which POSTs to `/api/actions/transitionCase` via the shared
+   `callAction` helper (the same bearer-token pattern `createCaseFromEvents`
+   already established).
+2. `action-routes.ts` verifies the JWT and calls `transitionCase` with
+   `{ userId, params, tools, callerJwt }`. `transitionCaseWith` validates
+   the field/value, fetches the case's current value for that field via
+   `tools.get`, rejects a no-op, then calls `tools.update('cases', ...)`
+   followed by `tools.create('caseActivity', ...)` — both through the
+   `X-App-Action`-bearing internal fetch, the same bypass every action in
+   this app uses.
+3. The response carries `{ activityRecorded: boolean }`. The UI only shows
+   an error toast when `activityRecorded` is `false` — the field change
+   itself already succeeded, so a full-blown error would misdescribe what
+   actually happened.
+4. The activity-history section's `useQuery('caseActivity', { where:
+   { caseId } }, orderBy: 'createdAt', orderDir: 'asc')` is a live
+   subscription exactly like every other query on the page — the new
+   `caseActivity` row broadcasts to every connected analyst's open case
+   page the instant it's created, with no extra wiring.
+5. `confirmIncident` follows the identical shape with one field
+   (`confirmedIncidentAt`) and one extra rule: once set, it can never be
+   set again (checked by reading the current record first).
+
+### Design decisions & tradeoffs
+
+- **Field-level `writableFields`, not a second schema or a new
+  permission kind.** DeepSpace's permission system already supports
+  restricting *which* fields a role can write, independent of whether it
+  can write the collection at all — using that existing mechanism to
+  carve out five fields was a much smaller change than inventing a
+  parallel enforcement path, and it's enforced in exactly the same place
+  (the Durable Object) as every other permission check in the app.
+- **Why `transitionCase` is one generic action, not four.** `status`,
+  `severity`, `priority`, and `assignedTo` share the exact same
+  validate → no-op-check → update → record-activity shape; the only real
+  difference is which enum (or "is this a real user id") applies. A
+  `Record<'status'|'severity'|'priority', readonly string[]>` dispatch
+  table expresses that difference in data, not in four near-identical
+  functions.
+- **The no-op guard is deliberately not relaxed for recovery.** See
+  "Likely bugs" below — this is the sharpest edge in the feature and the
+  one most worth being able to discuss unprompted.
+- **`caseActivity` denies `create` to every role, including `admin`.**
+  Not because an admin shouldn't be able to see activity (they can —
+  `read: true`) but because there's no legitimate reason for *anyone's
+  browser* to directly write an activity row; the server action is the
+  only correct origin for one, so the strongest guarantee available
+  (refused outright, for anyone) was the right default, not an
+  afterthought.
+
+### DeepSpace SDK capabilities used
+
+- Server actions (`ActionHandler`, `ActionTools.get`/`update`/`create`)
+  for `transitionCase`/`confirmIncident`, reached via the same
+  `X-App-Action` bypass every other action uses.
+- Field-level RBAC (`writableFields` in a `CollectionSchema`'s
+  `permissions` block) — the actual mechanism behind the lockdown; not
+  previously used elsewhere in this app before this extension.
+- `useQuery('caseActivity', ...)` for the live, read-only activity feed —
+  no new sync mechanism, the same WebSocket subscription every other
+  query in the app already relies on.
+- `useUserLookup().getName(...)` to resolve `createdBy` and
+  `assignedTo`-change actor/target ids to display names in the activity
+  sentences.
+
+### Likely bugs & how to diagnose them
+
+- **The one worth knowing cold: a dropped activity write cannot be
+  recovered by simply retrying the same transition.** `transitionCaseWith`
+  rejects a no-op (new value already equals current value) *before*
+  touching `tools.update`/`tools.create` — which is exactly right for
+  preventing meaningless activity noise, but means that if the case write
+  succeeded and the activity write failed, the case is now already at the
+  target value, so resubmitting the identical `{ field, value }` is
+  indistinguishable from "nothing to do" and gets rejected the same way.
+  `src/actions/case-actions.test.ts` has a test that induces exactly this
+  and asserts the retry fails with "No change," documenting the gap on
+  purpose rather than leaving it to be discovered as a surprise.
+- **Symptom: a direct client `put` on `status`/`severity`/`priority`/
+  `assignedTo`/`confirmedIncidentAt` "does nothing."** That's the intended
+  behavior, not a bug — `writableFields` on `member` excludes them, so the
+  Durable Object silently-to-the-caller refuses the field (the error is
+  real, but a fire-and-forget `core.put` has no UI code reading it). Check
+  `src/schemas/cases-schema.ts` before assuming the client code is wrong.
+- **Symptom: the activity history seems to be missing an entry.** First
+  check whether the corresponding `transitionCase`/`confirmIncident`
+  response actually had `activityRecorded: true` — if a test or a manual
+  repro set up `tools.create` to fail (or a real Durable-Object hiccup
+  happened), a missing row is the documented best-effort behavior, not
+  silent data loss from a different bug.
+
+### Interview questions you might get, and good answers
+
+- **"Why extend `cases` instead of adding a separate `incidents`
+  table?"** → A confirmed incident is the same object with two more facts
+  (severity, a confirmation timestamp), not a different kind of object.
+  Splitting it would mean duplicating title/summary/notes/activity-linkage
+  and migrating rows between tables as a case gets confirmed — real
+  complexity with no behavioral benefit at this app's size. Two additive
+  columns plus one child collection got the same lifecycle with zero
+  migration risk.
+- **"How do you know a non-admin genuinely can't write `status` directly,
+  rather than the UI just not offering a way to?"** → `tests/api.spec.ts`
+  opens a raw WebSocket — bypassing the UI and the action entirely — and
+  sends the literal `core.put` message the SDK would send for a direct
+  write. The server replies with `core.error`, `"cannot modify field
+  'status'"`, and a reload confirms the value never changed. A second test
+  sends the identical shape of message for `summary` and confirms it *is*
+  accepted, proving the lockdown is field-specific, not a side effect of
+  something else breaking.
+- **"Is the case update and its activity record written atomically?"** →
+  No, and I don't claim they are. RecordRoom has no cross-collection
+  transaction primitive. The two writes happen in a fixed order, and the
+  action returns `activityRecorded: false` for the (rare) case where the
+  first write succeeded and the second didn't. I have a test that
+  genuinely induces that exact scenario via a fake `tools` and asserts the
+  real code handles it the way I just described — not an assumption.
+- **"What happens if the activity write actually fails in production —
+  can you fix it after the fact?"** → Only by hand right now. The no-op
+  guard that keeps the activity log honest also blocks the obvious "just
+  retry" recovery, and I didn't build a reconciliation job (diffing
+  `cases` against `caseActivity` for gaps) in this pass — it's a real,
+  named piece of further work, not something I'm pretending doesn't exist.
+- **"Why does `confirmIncident` generate its own timestamp instead of
+  taking one as a parameter?"** → Because a client-suppliable timestamp
+  parameter is a client-suppliable lie about when something happened.
+  There's no `confirmedAt` field in the request shape at all — the action
+  calls `new Date().toISOString()` itself — so there's nothing for a
+  malicious or buggy client to override. I have a test that passes a 2020
+  date in the request body and asserts the real, current timestamp is
+  what gets stored.
+- **"Why doesn't `caseActivity` allow `admin` to create rows directly,
+  the way `cases` allows admin nearly everything?"** → Because there's no
+  legitimate reason for any browser, admin or not, to directly author an
+  audit-trail row — the server action is the only correct origin for one.
+  Where a blanket admin exception exists elsewhere in this app (e.g.
+  `cases`' full admin permissions), it's because an admin plausibly needs
+  to fix a stuck case; there's no equivalent "an admin plausibly needs to
+  hand-write a fake activity row" case here.
+
+### Practice exercise
+
+Build the reconciliation job this extension deliberately doesn't have:
+a `JobRoom`-triggered, admin-gated job that queries every `cases` row with
+a non-default `status` (or a set `confirmedIncidentAt`) and every
+`caseActivity` row, and reports cases whose current field values have no
+corresponding activity entry explaining how they got there. Don't
+auto-repair anything yet — just detect and report the gap (`console.log`
+or a new read-only collection is fine). Then think through, but don't
+necessarily build: how would you safely backfill a missing entry, given
+you don't know the *previous* value anymore once the update has already
+landed? (This is exactly the wall `transitionCaseWith`'s no-op guard runs
+into — your reconciliation job hits the same wall from the read side.)
+
+### Verifying the modification
+
+```
+npm run test:unit                        # case-actions.test.ts's 11 fake-tools tests
+npx deepspace test run e2e --port=5273   # api.spec.ts's protected-field + action tests, collab.spec.ts's live-sync test
+```
+
+`tests/collab.spec.ts`'s two-analyst test is the fastest way to see the
+whole feature working together: analyst B (the non-owner) changes
+severity and confirms the incident, and analyst A's already-open page
+shows the badge, the confirmation timestamp, and both activity entries
+appear without a reload.
 
 ---
 

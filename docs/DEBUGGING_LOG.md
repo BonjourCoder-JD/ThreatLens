@@ -481,3 +481,41 @@ ThreatLens — left open deliberately rather than scope-creeping into a
 second investigation; flagged to the user rather than silently chased or
 silently ignored. `npm run type-check`, `npm run lint`, and the full
 Playwright smoke suite (7/7) were re-confirmed passing after this change.
+
+---
+
+## Incident-management Day 2 — Verification pass: confirming the scaffold test failure still predates this phase's changes
+
+**Why this check, specifically.** The Day 2 instructions required not just
+re-running the test suite but *demonstrating* that the one known-failing
+unit test (`src/prerender-entry.test.tsx`) predates the incident-management
+extension's changes, rather than assuming it's the same unrelated failure
+documented above. Assuming would have been the easy path; this is the
+actual evidence instead.
+
+**Re-run result.** `npm run test:unit` after all of Day 1 and Day 2's
+changes: **41 of 42 tests pass**, same single failure, same file, same
+error (`TypeError: Cannot read properties of null (reading 'useState')` in
+`ToastProvider`, via `react-dom-server-legacy.node.development.js` —
+identical stack to the one recorded in "Day 2 — Incident 3" above).
+
+**Evidence it predates this phase, not an assumption:**
+- `git log --oneline -- src/prerender-entry.test.tsx` shows exactly one
+  commit touching this file: `822d86c`, the very first scaffold commit
+  ("feat: scaffold ThreatLens with synthetic auth-event pipeline") — before
+  any statistical detection, case workflow, ML integration, or
+  incident-management work existed.
+- `git diff --stat HEAD -- src/prerender-entry.test.tsx
+  src/components/ui/Toast.tsx` (the file under test and the component the
+  stack trace blames) against the start of this phase: **empty** — neither
+  file was touched by any Day 1 or Day 2 change.
+- The exact failure was already independently investigated and documented
+  as a separate, pre-existing scaffold bug in "Day 2 — Incident 3" above,
+  during the royal-blue-redesign phase, long before the incident-management
+  extension existed.
+
+**Conclusion.** This is the same pre-existing, previously-documented
+scaffold issue, confirmed again — not re-asserted on faith — by diffing the
+two files involved and finding zero changes from either Day 1 or Day 2 of
+this extension. 41/42 is the accurate, honest unit-test result for this
+phase; the 42nd was never claimed as passing.
