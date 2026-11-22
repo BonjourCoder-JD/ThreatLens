@@ -122,6 +122,99 @@ dsTest.describe('Job room direct-API authorization', () => {
       dsExpect(rejected?.payload?.error).toContain('Write access denied')
     },
   )
+
+  // Completes the set: `authorizeWrite` (worker.ts) admin-gates all three
+  // job types identically, but only two had a direct-API test proving it —
+  // this closes that coverage gap rather than relying on "same code path"
+  // as an unverified assumption.
+  dsTest(
+    'non-admin enqueue of recompute-stat-scores is refused over the raw WebSocket',
+    async ({ users }) => {
+      const [analyst] = await users(1)
+      const messages = await attemptJobEnqueue(analyst.page, 'recompute-stat-scores')
+
+      const enqueued = messages.find((m) => m.type === 'job.update' && m.payload?.kind === 'enqueued')
+      const rejected = messages.find((m) => m.type === 'core.error')
+
+      dsExpect(enqueued).toBeUndefined()
+      dsExpect(rejected).toBeTruthy()
+      dsExpect(rejected?.payload?.error).toContain('Write access denied')
+    },
+  )
+})
+
+/**
+ * Role self-promotion is blocked, verified by actual behavior, not just
+ * read from the SDK's source. `src/schemas/users-schema.ts` has no
+ * `writableFields` restricting `role` — the only thing stopping a member
+ * from writing `{ role: 'admin' }` on their own row (which `update: 'own'`
+ * otherwise permits) is a hardcoded guard in the compiled SDK
+ * (`node_modules/deepspace/dist/worker.js`'s `SYSTEM_ASSIGNED_COLUMNS`
+ * check), not anything this app's own schema declares. That's a real but
+ * previously untested dependency on an SDK guarantee — this closes the gap
+ * with a direct-API proof, same pattern as the protected-case-field tests
+ * above, plus an independent behavioral check (the admin-gated page still
+ * refuses them) rather than trusting the write's error message alone.
+ */
+dsTest.describe('User role RBAC (SDK-level system-managed-column guard)', () => {
+  dsTest('a member cannot self-promote to admin via a direct write to their own user row', async ({ users }) => {
+    const [analyst] = await users(1)
+
+    await analyst.page.goto('/home')
+    const tokenRes = await analyst.page.request.post('/api/auth/token')
+    const { token } = (await tokenRes.json()) as { token?: string }
+
+    const messages = await analyst.page.evaluate(
+      async ({ token, roomId }) => {
+        // The JWT's `sub` claim is the caller's own userId (see
+        // node_modules/deepspace/dist/worker.js's auth verification) —
+        // decoding it client-side is the only way this test can target
+        // "my own user row" without a dedicated endpoint for it.
+        const payload = JSON.parse(atob(token!.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))) as { sub: string }
+        const myUserId = payload.sub
+
+        return await new Promise<unknown[]>((resolve) => {
+          const seen: unknown[] = []
+          const ws = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/ws/${roomId}?token=${token}`)
+          const finish = () => {
+            ws.close()
+            resolve(seen)
+          }
+          ws.onopen = () => {
+            ws.send(
+              JSON.stringify({
+                type: 'core.put',
+                payload: { collection: 'users', recordId: myUserId, data: { role: 'admin' } },
+              }),
+            )
+          }
+          ws.onmessage = (ev) => {
+            // First message is always the proactive MSG.USER_INFO — keep
+            // listening past it for the actual error, same as the
+            // protected-case-field tests above.
+            const msg = JSON.parse(ev.data as string) as { type: string }
+            seen.push(msg)
+            if (msg.type === 'core.error') finish()
+          }
+          ws.onerror = () => finish()
+          setTimeout(finish, 6000)
+        })
+      },
+      { token, roomId: jobRoomId() },
+    )
+
+    const rejected = (messages as Array<{ type: string; payload?: { error?: string } }>).find(
+      (m) => m.type === 'core.error',
+    )
+    dsExpect(rejected).toBeTruthy()
+    dsExpect(rejected?.payload?.error).toContain("'role' is system-managed")
+
+    // Independent behavioral proof, not just the write's own error message:
+    // an admin-gated page still refuses them, meaning their role is
+    // genuinely unchanged server-side, not just "no success message arrived."
+    await analyst.page.goto('/admin')
+    await dsExpect(analyst.page.getByText('Admins only')).toBeVisible({ timeout: 15_000 })
+  })
 })
 
 /**
