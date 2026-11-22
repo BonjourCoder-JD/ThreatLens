@@ -25,9 +25,9 @@ audit trail.
 
 - **Authentication** (`DeepSpaceAuthProvider`, `<AuthGate>`) — no custom
   auth code; sign-in via Google/GitHub.
-- **RecordRoom** — four collections (`users`, `authEvents`, `cases`,
-  `caseNotes`) with role-based permissions enforced server-side in the
-  Durable Object.
+- **RecordRoom** — five collections (`users`, `authEvents`, `cases`,
+  `caseNotes`, `caseActivity`) with role-based AND field-level permissions
+  enforced server-side in the Durable Object.
 - **JobRoom (background jobs)** — four admin-gated background jobs for
   bulk data operations (synthetic-data import, statistical recompute,
   ML-score import).
@@ -95,27 +95,22 @@ was typed by a human.
   (as the app owner) and confirmed: 1,000 events imported, a second import
   run left the count at exactly 1,000 (idempotent), and the statistical
   recompute correctly flagged 48 of 1,000 events.
-- [ ] **Not yet done:** personally clicked "Import ML scores" in the
-  running app and confirmed the result (Claude verified the underlying
-  Python pipeline and the job's logic directly, and confirmed a non-admin
-  cannot trigger it, but has not — and structurally cannot — click the
-  real admin button itself; that step is reserved for you).
-- [ ] **Not yet done:** reviewed the dashboard's filter/summary behavior
-  against real, populated data with your own eyes end-to-end as a final
-  UX pass (Claude's automated tests cover this functionally, but a human
-  product read-through is still worth doing before submission).
-- [ ] **Not yet done:** deployed the app (`npx deepspace deploy`) and
-  confirmed the live URL loads and behaves correctly for a reviewer
-  without your local dev environment.
+- [x] Personally clicked "Import ML scores" in the running app and
+  confirmed the result, as part of a guided manual-verification pass
+  after deployment.
+- [x] Reviewed the dashboard's filter/summary behavior against real,
+  populated data with your own eyes end-to-end, as part of that same
+  verification pass.
+- [x] Deployed the app (`npx deepspace deploy`) and confirmed the live
+  URL (https://threatlens-jd.app.space) loads and behaves correctly for
+  a reviewer without your local dev environment — confirmed by you and
+  independently by read-only automated checks against the live URL
+  (every main route, zero console errors, mobile viewport).
+- [x] Personally clicked through the incident-management extension in
+  the running app — set a severity, clicked "Confirm as incident," and
+  watched the activity history fill in.
 - [ ] **Not yet done:** a fresh-eyes read-through of this submission note
   and the README before actually submitting.
-- [ ] **Not yet done:** personally clicked through the incident-management
-  extension in the running app yourself — set a severity, clicked "Confirm
-  as incident," and watched the activity history fill in (Claude verified
-  this with real, non-mocked Playwright tests, including two separately
-  signed-in analyst accounts proving the live sync and that confirmation
-  isn't restricted to a case's creator, but hasn't — and structurally
-  cannot — click the real buttons as you in your own browser).
 
 ---
 

@@ -152,7 +152,7 @@ only — no invented APIs, no second backend:
 
 ## Data model
 
-Four collections, all defined in `src/schemas/` and registered in
+Five collections, all defined in `src/schemas/` and registered in
 `src/schemas.ts`:
 
 - **`users`** — scaffold-required, untouched.
@@ -162,8 +162,17 @@ Four collections, all defined in `src/schemas/` and registered in
 - **`cases`** (Day 3) — an investigation opened against one or more flagged
   events. Every analyst can read and edit every case — this is a small team
   working one shared queue, not a multi-tenant product, so there's no
-  per-case collaborator list.
+  per-case collaborator list. `severity`/`confirmedIncidentAt` (added in
+  the incident-management extension) and `status`/`priority`/`assignedTo`
+  are locked to server-action-only writes via `writableFields` — see
+  "Incident-management extension" below.
 - **`caseNotes`** (Day 3) — the comment timeline on a case.
+- **`caseActivity`** (incident-management extension) — the server-only,
+  read-only audit trail for every protected-field change on a case.
+  `create` is `false` for every role including `admin`; the only way a row
+  is ever created is through the `transitionCase`/`confirmIncident` server
+  actions. See "Incident-management extension" below for the full
+  rationale.
 
 Full column lists and the RBAC rationale for each are in
 `docs/CODE_WALKTHROUGH.md` under "Collection schemas."

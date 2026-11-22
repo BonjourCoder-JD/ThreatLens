@@ -8,6 +8,7 @@ runs live inside the app, and an offline Isolation Forest (scikit-learn)
 model trained outside it.
 
 Built for a DeepSpace Software Engineering Internship evaluation.
+**Live app: [https://threatlens-jd.app.space](https://threatlens-jd.app.space)**
 
 ## The problem
 
@@ -198,14 +199,18 @@ failure scenarios.
 
 ## Deployment
 
+**Live at [https://threatlens-jd.app.space](https://threatlens-jd.app.space).**
+Deployed with `npx deepspace deploy`; verified afterward with a read-only
+check of every main route (`/`, `/home`, `/dashboard`, `/cases`, `/admin`,
+`/settings`, `/api-status`) for a 200 response and zero console errors, a
+mobile-viewport check for layout overflow, and a byte-for-byte match
+between the served asset filenames and the local production build from
+the exact commit on `origin/main` at deploy time — not just that the URL
+resolves.
+
 ```bash
 npx deepspace deploy
 ```
-
-**This app has not yet been deployed to a live URL as of this README.**
-Local development and the full test suite are the verified state; a
-deploy is a deliberate next step, not something to infer from this
-document.
 
 ## ML evaluation — results and limitations
 
